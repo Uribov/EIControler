@@ -810,7 +810,6 @@ class PoseForm : Form
         {
             yaw += dx * 0.01f;
             pitch += dy * 0.01f;
-            pitch = Math.Max(-1.45f, Math.Min(1.45f, pitch));
             Invalidate();
             return;
         }

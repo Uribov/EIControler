@@ -89,7 +89,7 @@ namespace EIGlove
         float _springWasPercent;
         bool _springWasOn;
         // 五指三节上一帧的 bend，用于单帧限幅
-        readonly float[] _lastBend = new float[3];
+        readonly float[] _lastBend = new float[15];
 
         long _rxCount;
         long _badCount;
@@ -103,6 +103,7 @@ namespace EIGlove
         JSONStorableFloat _offsetYJSON;
         JSONStorableFloat _offsetZJSON;
         JSONStorableFloat _smoothJSON;
+        JSONStorableFloat _fingerMapModeJSON;
 
         public override void Init()
         {
@@ -135,6 +136,11 @@ namespace EIGlove
                 _smoothJSON = new JSONStorableFloat("smooth", 0.7f, 0f, 0.95f, false);
                 RegisterFloat(_smoothJSON);
                 CreateSlider(_smoothJSON);
+
+                // 手指轴向映射模式（0~5），运行时拖动切换，不用重载；实测 3 = (x, z, -y) 正确
+                _fingerMapModeJSON = new JSONStorableFloat("fingerMap", 3f, 0f, 5f, true);
+                RegisterFloat(_fingerMapModeJSON);
+                CreateSlider(_fingerMapModeJSON);
 
                 _lastReport = Time.realtimeSinceStartup;
 
@@ -372,7 +378,9 @@ namespace EIGlove
                     if (_handOut.outputConnectedJSON != null)
                     {
                         _outputConnectedWas = _handOut.outputConnectedJSON.val;
-                        _handOut.outputConnectedJSON.val = true;
+                        // 必须走 SetVal 才会触发 SetOutputConnected，更新内部 _outputConnected；
+                        // 直接赋 .val 不会更新，导致 SetXxxBend 被静默跳过
+                        _handOut.outputConnectedJSON.SetVal(true);
                     }
                     _handOutReady = true;
                     string range = "n/a";
@@ -687,18 +695,42 @@ namespace EIGlove
                 // 目标先按强度插值，再按平滑系数逼近，避免抖动
                 Quaternion blended = Quaternion.Slerp(_restRotation[i], goal, strength);
                 _applied[i] = Quaternion.Slerp(_applied[i], blended, slerpK);
-                if (_writing && !HANDOUT_TEST)
+                // HANDOUT_TEST 下手指出 HandOutput 驱动，但 hand 骨骼仍要写，手背才能跟着转
+                if (_writing && (!HANDOUT_TEST || i == 0))
                 {
-                    bone.localRotation = _applied[i];
+                    bone.localRotation = BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 1);
                 }
             }
 
-            // 数据驱动：右手食指三节走官方 HandOutput 通道（其余手指待标定后再接）
-            if (HANDOUT_TEST && _handOutReady && _handOut != null && _applied != null)
+            // 直接写死测试：绕过数据/限幅，确认 HandOutput 通道本身（写近节 Proximal）
+            if (HANDOUT_TEST && TEST_DIRECT && _handOutReady && _handOut != null)
             {
-                WriteFingerBend(_applied[4], _handOut.indexProximalBendJSON, 0);
-                WriteFingerBend(_applied[5], _handOut.indexMiddleBendJSON, 1);
-                WriteFingerBend(_applied[6], _handOut.indexDistalBendJSON, 2);
+                _handOut.indexProximalBendJSON.val = 30f;
+                if (DIAG && (Time.frameCount % 30 == 0))
+                {
+                    float cur = (_handOut.indexProximal != null) ? _handOut.indexProximal.currentBend : -999f;
+                    float springs = (_handControl != null && _handControl.handJointSprings != null)
+                        ? _handControl.handJointSprings.percent : -1f;
+                    SuperController.LogMessage($"[EIGlove:DIAG] direct i1b={_handOut.indexProximalBendJSON.val:F1} cur={cur:F1} springs={springs:F1}");
+                }
+            }
+            else if (HANDOUT_TEST && _handOutReady && _handOut != null && _applied != null)
+            {
+                WriteFingerBend(_applied[1], _handOut.thumbProximalBendJSON, 0);
+                WriteFingerBend(_applied[2], _handOut.thumbMiddleBendJSON, 1);
+                WriteFingerBend(_applied[3], _handOut.thumbDistalBendJSON, 2);
+                WriteFingerBend(_applied[4], _handOut.indexProximalBendJSON, 3);
+                WriteFingerBend(_applied[5], _handOut.indexMiddleBendJSON, 4);
+                WriteFingerBend(_applied[6], _handOut.indexDistalBendJSON, 5);
+                WriteFingerBend(_applied[7], _handOut.middleProximalBendJSON, 6);
+                WriteFingerBend(_applied[8], _handOut.middleMiddleBendJSON, 7);
+                WriteFingerBend(_applied[9], _handOut.middleDistalBendJSON, 8);
+                WriteFingerBend(_applied[10], _handOut.ringProximalBendJSON, 9);
+                WriteFingerBend(_applied[11], _handOut.ringMiddleBendJSON, 10);
+                WriteFingerBend(_applied[12], _handOut.ringDistalBendJSON, 11);
+                WriteFingerBend(_applied[13], _handOut.pinkyProximalBendJSON, 12);
+                WriteFingerBend(_applied[14], _handOut.pinkyMiddleBendJSON, 13);
+                WriteFingerBend(_applied[15], _handOut.pinkyDistalBendJSON, 14);
             }
 
             // 每帧打日志会拖慢 VaM（180fps 时磁盘/面板会被刷爆），限到约 6Hz
@@ -729,10 +761,13 @@ namespace EIGlove
         const bool DIRECT = false;
         // 渲染前重写骨骼：绕开 VaM 自己的 LateUpdate 骨骼/蒙皮更新
         const bool RENDER_WRITE = true;
-        // 测试模式：只驱动右手食指三节（HandOutput JSON），停掉直接写骨骼
-        const bool HANDOUT_TEST = true;
-        // 四元数 → bend 的放大系数
-        const float BEND_GAIN = 0.8f;
+        // 动捕手柄场景：物理冻结，直接写骨骼（冻结时物理不覆盖）。
+        // 物理开启时 HandOutput 的 targetRotation 才会被跟随，但会被物理覆盖，不适合长时间动捕。
+        const bool HANDOUT_TEST = false;
+        // 直接写死测试：绕过数据计算，确认 HandOutput→骨骼通道本身是否活着
+        const bool TEST_DIRECT = false;
+        // 四元数 → bend 的放大系数（0.8 太小，工具大幅弯曲手指才动一点）
+        const float BEND_GAIN = 2.0f;
         // 单帧 bend 最大变化量（度），压物理链冲击
         const float BEND_STEP_MAX = 5f;
 
@@ -793,6 +828,27 @@ namespace EIGlove
             }
         }
 
+        // 用户标定：VaM z = 固件 y、VaM y = 固件 x 已对；
+        // 另外两组（x/y 的源）互换：VaM x = 固件 x，VaM y = 固件 z
+        // 工具轴 → VaM 骨骼局部轴（fingerMap 滑块运行时切换，0~5）
+        static Quaternion BoneToUnity(int i, Quaternion q, int mode)
+        {
+            if (i == 0)
+            {
+                return new Quaternion(q.x, q.z, q.y, q.w);
+            }
+            switch (mode)
+            {
+                case 0: return new Quaternion(q.x, q.z, q.y, q.w);
+                case 1: return new Quaternion(-q.x, q.z, q.y, q.w);
+                case 2: return new Quaternion(q.x, -q.z, q.y, q.w);
+                case 3: return new Quaternion(q.x, q.z, -q.y, q.w);
+                case 4: return new Quaternion(-q.x, -q.z, q.y, q.w);
+                case 5: return new Quaternion(q.z, q.x, q.y, q.w);
+                default: return q;
+            }
+        }
+
         void WriteBonesNow()
         {
             if (_bones == null || _applied == null)
@@ -801,11 +857,23 @@ namespace EIGlove
             }
             for (int i = 0; i < JointCount; i++)
             {
+                // HANDOUT_TEST 下只重写 hand，手指交给 HandOutput，避免双驱动
+                if (HANDOUT_TEST && i != 0)
+                {
+                    continue;
+                }
                 if (_bones[i] != null)
                 {
-                    _bones[i].localRotation = _applied[i];
+                    _bones[i].localRotation = BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 1);
                 }
             }
+        }
+
+        // 从最近一包数据里取某个关节的四元数（协议顺序 w,x,y,z）
+        Quaternion DataQ(int joint)
+        {
+            int o = joint * 4;
+            return new Quaternion(_latest[o + 1], _latest[o + 2], _latest[o + 3], _latest[o]);
         }
 
         // 把相对四元数转成 HandOutput 的 bend（角度），带放大系数和单帧限幅
@@ -815,15 +883,29 @@ namespace EIGlove
             {
                 return;
             }
-            float z = q.eulerAngles.z;
-            if (z > 180f)
+            // 数据绕 x 轴（工具输入 X=30 → 四元数 x 分量），直接取 X 欧拉角
+            float x = q.eulerAngles.x;
+            if (x > 180f)
             {
-                z -= 360f;
+                x -= 360f;
             }
-            float bend = -z * BEND_GAIN;
+            // mount 把数据的 x 旋转分散到 x/y，Z 恒为 0；改取 X 欧拉角
+            float ex = q.eulerAngles.x;
+            float ey = q.eulerAngles.y;
+            float ez = q.eulerAngles.z;
+            if (ex > 180f)
+            {
+                ex -= 360f;
+            }
+            float bend = ex * BEND_GAIN;
+
+            if (DIAG && seg == 4 && (Time.frameCount % 30 == 0))
+            {
+                SuperController.LogMessage($"[EIGlove:DIAG] bend seg={seg} euler=({ex:F1},{ey:F1},{ez:F1}) bend={bend:F1}");
+            }
 
             // 关节极限之外的幅度直接放弃，避免物理把手指折崩
-            bend = Mathf.Clamp(bend, -35f, 35f);
+            bend = Mathf.Clamp(bend, -50f, 50f);
 
             // 单帧限幅：目标变化再快也只让它每帧走 BEND_STEP_MAX 度，
             // 避免 targetRotation 突变把力传给整条物理链
