@@ -13,6 +13,7 @@
 
 import argparse
 import math
+import os
 import queue
 import socket
 import struct
@@ -208,7 +209,7 @@ def run_save(path, joints, from_sim):
     import matplotlib.pyplot as plt
 
     if from_sim:
-        sys.path.insert(0, __file__.rsplit("/", 2)[0])
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         from tools.eic_bridge import frame_to_joints, iter_sim
 
         gen = iter_sim()

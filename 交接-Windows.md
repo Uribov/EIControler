@@ -127,3 +127,26 @@ python tools\eic_frame.py           # 帧协议自检
 2. 板子到了烧固件，读 IMU 确认数据
 3. 真手套接上位机，替代 `--sim`
 4. 调朝向、调平滑，确定手感参数
+
+## 本机验证记录（2026-11-14，Windows）
+
+在 `E:\EIControler-main` 上把 Windows 侧能验的全部跑通，结果全绿：
+
+| 命令 | 结果 |
+|---|---|
+| `python tools\eic_bridge.py --sim --verbose` | 正常发包，约 182 fps，手指角度在动 |
+| `python tests\test_hand_view.py` | 全链路（UDP→解算→正向运动学）全过 |
+| `python tests\check_proto_sync.py` | 两份协议实现一致 |
+| `python tools\eic_frame.py` | 帧自检通过 |
+| `dotnet run --project tests\csharp\EIProtoTest.csproj` | C# 协议解析 10 项全过 |
+| `python tools\eic_hand_view.py --save hand.png --from-sim` | 手骨架图正常生成 |
+
+### 本机修的两个问题
+
+1. **工具脚本的根路径写法只在 Linux 生效。** `eic_bridge.py` 和 `eic_hand_view.py` 里用 `__file__.rsplit("/", 2)` 算项目根目录，Windows 下 `__file__` 是反斜杠，直接跑 `python tools\eic_bridge.py` 会报 `No module named 'tools'`。两处都已改成 `os.path.dirname(os.path.dirname(os.path.abspath(__file__)))`。
+2. **C# 测试目标框架 net10.0 编译不过。** 本机只有 .NET 6 SDK（6.0.410），`tests\csharp\EIProtoTest.csproj` 已从 net10.0 降到 net6.0。协议解析只用基础类型，改后 10 项全过。
+
+### 仍然没做（和原状态一致）
+
+- **VaM 插件实编译**：本机没装 VaM，`EIGloveDriver.cs` 依赖 VaM 的 API，只能进 VaM 里编译。装好 VaM 后按上面第 2 步做即可。
+- **上板读 IMU / 磁标定 / 手感调参**：板子还没到。

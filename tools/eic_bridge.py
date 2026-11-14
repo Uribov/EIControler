@@ -11,12 +11,13 @@
 
 import argparse
 import math
+import os
 import socket
 import struct
 import sys
 import time
 
-sys.path.insert(0, __file__.rsplit("/", 2)[0])
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools.eic_frame import FRAME_SIZE, parse_stream  # noqa: E402
 
