@@ -8,7 +8,6 @@
 // 改解析规则时两处要同步。
 
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -57,7 +56,8 @@ namespace EIGlove
         Thread _rxThread;
         volatile bool _running;
 
-        readonly ConcurrentQueue<float[]> _queue = new ConcurrentQueue<float[]>();
+        readonly Queue<float[]> _queue = new Queue<float[]>();
+        readonly object _queueLock = new object();
 
         Transform[] _bones;
         Quaternion[] _restRotation;
@@ -65,6 +65,19 @@ namespace EIGlove
         float[] _latest;
         float _lastPacketTime = -999f;
         float _currentStrength;
+
+        // VaM 1.22 的人物骨骼是 DAZBone（挂在骨骼 Transform 上），皮肤由
+        // DAZSkinV2 做 GPU 蒙皮。名字匹配到同名 Transform 不一定是皮肤骨骼，
+        // 所以优先通过 DAZCharacter.rootBonesForSkinning 解析。
+        DAZBones _dazBones;
+        string[] _activeNames;
+        bool _renderHookInstalled;
+        float _lastOverrideCheck = -999f;
+        // 只有正在跟随数据（或回位动画还没走完）时才写骨骼。
+        // 断流后完全放手，避免每帧强写 rest 与 VaM 的 idle 动画打架。
+        bool _writing;
+        long _preRenderCount;
+        float _lastPreDiff = -1f;
 
         long _rxCount;
         long _badCount;
@@ -107,13 +120,21 @@ namespace EIGlove
                 CreateSlider(_offsetZJSON);
 
                 // 关节平滑，压 IMU 噪声，0 表示不平滑
-                _smoothJSON = new JSONStorableFloat("smooth", 0.35f, 0f, 0.95f, false);
+                _smoothJSON = new JSONStorableFloat("smooth", 0.7f, 0f, 0.95f, false);
                 RegisterFloat(_smoothJSON);
                 CreateSlider(_smoothJSON);
 
                 _lastReport = Time.realtimeSinceStartup;
 
                 FindBones();
+                DiagProbe();
+
+                // 渲染前再写一次骨骼。VaM 的 LateUpdate 里还有自己的骨骼/蒙皮
+                // 更新，普通 LateUpdate 可能被它覆盖；onPreRender 在所有
+                // LateUpdate 之后再执行，能保证渲染用的是我们的姿态。
+                Camera.onPreRender += OnPreRenderHook;
+                _renderHookInstalled = true;
+
                 StartReceiver();
 
                 SuperController.LogMessage("[EIGlove] 初始化完成，监听 UDP " + UDP_PORT);
@@ -127,10 +148,24 @@ namespace EIGlove
         void FindBones()
         {
             var names = (_rightHandJSON != null && _rightHandJSON.val) ? BoneNamesRight : BoneNamesLeft;
+            _activeNames = names;
 
             _bones = new Transform[JointCount];
             _restRotation = new Quaternion[JointCount];
             _applied = new Quaternion[JointCount];
+
+            try
+            {
+                var dc = containingAtom.GetComponentInChildren<DAZCharacter>(true);
+                if (dc != null)
+                {
+                    _dazBones = dc.rootBonesForSkinning;
+                }
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove] 取 DAZCharacter 失败: " + e.Message);
+            }
 
             var all = containingAtom.GetComponentsInChildren<Transform>(true);
             var map = new Dictionary<string, Transform>();
@@ -154,10 +189,35 @@ namespace EIGlove
             }
 
             int found = 0;
+            int foundViaDaz = 0;
             for (int i = 0; i < JointCount; i++)
             {
-                Transform t;
-                if (map.TryGetValue(names[i], out t))
+                Transform t = null;
+                DAZBone db = null;
+                if (_dazBones != null)
+                {
+                    try
+                    {
+                        db = _dazBones.GetDAZBone(names[i]);
+                    }
+                    catch { }
+                }
+
+                if (db != null)
+                {
+                    t = db.transform;
+                    foundViaDaz++;
+                }
+                else
+                {
+                    Transform tmp;
+                    if (map.TryGetValue(names[i], out tmp))
+                    {
+                        t = tmp;
+                    }
+                }
+
+                if (t != null)
                 {
                     _bones[i] = t;
                     _restRotation[i] = t.localRotation;
@@ -166,7 +226,7 @@ namespace EIGlove
                 }
             }
 
-            SuperController.LogMessage($"[EIGlove] 找到 {found}/{JointCount} 个骨骼（{(names == BoneNamesRight ? "右手" : "左手")}）");
+            SuperController.LogMessage($"[EIGlove] 找到 {found}/{JointCount} 个骨骼（{(names == BoneNamesRight ? "右手" : "左手")}，其中 {foundViaDaz} 个经 DAZBone 解析）");
 
             if (found == 0)
             {
@@ -176,6 +236,140 @@ namespace EIGlove
                 {
                     SuperController.LogError("  " + handLike[i]);
                 }
+            }
+        }
+
+        static string TransformPath(Transform t)
+        {
+            string s = t.name;
+            int guard = 0;
+            for (var p = t.parent; p != null && guard < 8; p = p.parent)
+            {
+                s = p.name + "/" + s;
+                guard++;
+            }
+            return s;
+        }
+
+        // 一次性诊断：确认 _bones[5]（index2）到底是什么节点，是否参与蒙皮
+        void DiagProbe()
+        {
+            try
+            {
+                var all = containingAtom.GetComponentsInChildren<Transform>(true);
+                int sameName = 0;
+                foreach (var t in all)
+                {
+                    if (t.name == _activeNames[5])
+                    {
+                        sameName++;
+                    }
+                }
+
+                var probe = _bones[5];
+                if (probe == null)
+                {
+                    SuperController.LogMessage("[EIGlove:DIAG] probe null（i2 没找到）");
+                    return;
+                }
+
+                var kids = new List<string>();
+                for (int i = 0; i < probe.childCount && i < 10; i++)
+                {
+                    kids.Add(probe.GetChild(i).name);
+                }
+
+                DAZBone db = null;
+                if (_dazBones != null)
+                {
+                    try
+                    {
+                        db = _dazBones.GetDAZBone(_activeNames[5]);
+                    }
+                    catch { }
+                }
+
+                string ctl = "none";
+                if (db != null && db.control != null)
+                {
+                    ctl = db.control.name;
+                }
+
+                string skinInfo = "none";
+                bool inNodes = false;
+                var skins = containingAtom.GetComponentsInChildren<DAZSkinV2>(true);
+                if (skins.Length > 0)
+                {
+                    int nodeCount = 0;
+                    bool rootOK = false;
+                    bool rootMatch = false;
+                    bool delay1 = false;
+                    bool multithread = false;
+                    foreach (var sk in skins)
+                    {
+                        if (sk == null)
+                        {
+                            continue;
+                        }
+                        if (sk.root != null)
+                        {
+                            rootOK = true;
+                            if (sk.root == _dazBones)
+                            {
+                                rootMatch = true;
+                            }
+                        }
+                        delay1 = delay1 || sk.delayDisplayOneFrame;
+                        multithread = multithread || sk.useMultithreadedSkinning;
+                        if (sk.nodes != null)
+                        {
+                            nodeCount += sk.nodes.Length;
+                            foreach (var nd in sk.nodes)
+                            {
+                                if (nd != null && nd.name == probe.name)
+                                {
+                                    inNodes = true;
+                                }
+                            }
+                        }
+                    }
+                    skinInfo = $"skins={skins.Length} nodes={nodeCount} rootOK={rootOK} rootMatch={rootMatch} multithread={multithread} delay1={delay1}";
+                }
+
+                SuperController.LogMessage(
+                    $"[EIGlove:DIAG] i2 name={probe.name} path={TransformPath(probe)} children={probe.childCount} [{string.Join(",", kids.ToArray())}] sameName={sameName} dazBone={(db != null)} jointDisabled={(db != null ? db.jointRotationDisabled.ToString() : "n/a")} control={ctl} inSkinNodes={inNodes} {skinInfo}");
+
+                if (!inNodes)
+                {
+                    // 骨骼不在蒙皮节点里，打印 skin 里真正的手部节点名，方便对照
+                    var cand = new List<string>();
+                    foreach (var sk in skins)
+                    {
+                        if (sk == null || sk.nodes == null)
+                        {
+                            continue;
+                        }
+                        foreach (var nd in sk.nodes)
+                        {
+                            if (nd != null && nd.name != null
+                                && (nd.name.Contains("Index") || nd.name.Contains("Hand") || nd.name.Contains("Thumb"))
+                                && !cand.Contains(nd.name))
+                            {
+                                cand.Add(nd.name);
+                            }
+                        }
+                    }
+                    var shown = new List<string>();
+                    for (int i = 0; i < cand.Count && i < 20; i++)
+                    {
+                        shown.Add(cand[i]);
+                    }
+                    SuperController.LogMessage("[EIGlove:DIAG] skin 里的手部节点: " + string.Join(",", shown.ToArray()));
+                }
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove:DIAG] probe 失败: " + e);
             }
         }
 
@@ -199,11 +393,13 @@ namespace EIGlove
                             continue;
                         }
 
-                        _queue.Enqueue(q);
-                        while (_queue.Count > 2)
+                        lock (_queueLock)
                         {
-                            float[] drop;
-                            _queue.TryDequeue(out drop);
+                            _queue.Enqueue(q);
+                            while (_queue.Count > 2)
+                            {
+                                _queue.Dequeue();
+                            }
                         }
                         _rxCount++;
                     }
@@ -222,11 +418,21 @@ namespace EIGlove
                 return;
             }
 
-            float[] incoming;
-            while (_queue.TryDequeue(out incoming))
+            // 把我们的 onPreRender 回调重新挂到 delegate 链末尾，
+            // 确保在 VaM 自己的 onPreRender 之后执行（它也会注册这个事件）。
+            if (_renderHookInstalled)
             {
-                _latest = incoming;
-                _lastPacketTime = Time.realtimeSinceStartup;
+                Camera.onPreRender -= OnPreRenderHook;
+                Camera.onPreRender += OnPreRenderHook;
+            }
+
+            lock (_queueLock)
+            {
+                while (_queue.Count > 0)
+                {
+                    _latest = _queue.Dequeue();
+                    _lastPacketTime = Time.realtimeSinceStartup;
+                }
             }
 
             bool fresh = (Time.realtimeSinceStartup - _lastPacketTime) < PACKET_TIMEOUT;
@@ -236,10 +442,22 @@ namespace EIGlove
                 ? (_strengthJSON != null ? _strengthJSON.val : 1.0f)
                 : 0.0f;
 
-            // 强度用指数逼近，断流时手掌会平滑落回原始姿势而不是硬切
-            float k = 1.0f - Mathf.Exp(-Time.deltaTime * 6.0f);
-            _currentStrength = Mathf.Lerp(_currentStrength, targetStrength, k);
-            float strength = _currentStrength;
+            // 直通模式：立刻用满强度；否则按指数逼近（断流时手慢慢回位）
+            float strength;
+            if (DIRECT)
+            {
+                strength = targetStrength;
+                _currentStrength = targetStrength;
+            }
+            else
+            {
+                float k = 1.0f - Mathf.Exp(-Time.deltaTime * 6.0f);
+                _currentStrength = Mathf.Lerp(_currentStrength, targetStrength, k);
+                strength = _currentStrength;
+            }
+
+            // 强度超过 1 会让 Slerp 外插，产生过冲/抖动，这里钳死
+            strength = Mathf.Clamp(strength, 0f, 1f);
 
             Quaternion mount = Quaternion.Euler(
                 _offsetXJSON != null ? _offsetXJSON.val : 0f,
@@ -247,7 +465,10 @@ namespace EIGlove
                 _offsetZJSON != null ? _offsetZJSON.val : 0f);
 
             float smooth = _smoothJSON != null ? _smoothJSON.val : 0.35f;
-            float slerpK = 1.0f - smooth;
+            float slerpK = DIRECT ? 1.0f : (1.0f - smooth);
+
+            // 断流且回位动画结束后就停止写骨骼，把控制权还给 VaM
+            _writing = want || _currentStrength > 0.01f;
 
             for (int i = 0; i < JointCount; i++)
             {
@@ -272,10 +493,111 @@ namespace EIGlove
                 // 目标先按强度插值，再按平滑系数逼近，避免抖动
                 Quaternion blended = Quaternion.Slerp(_restRotation[i], goal, strength);
                 _applied[i] = Quaternion.Slerp(_applied[i], blended, slerpK);
-                bone.localRotation = _applied[i];
+                if (_writing)
+                {
+                    bone.localRotation = _applied[i];
+                }
+            }
+
+            // 每帧打日志会拖慢 VaM（180fps 时磁盘/面板会被刷爆），限到约 6Hz
+            if (DIAG && _latest != null && _bones[0] != null && (Time.frameCount % 15 == 0))
+            {
+                string msg = string.Format(
+                    "[EIGlove:DIAG] en={0} st={1:F2} cur={2:F2} sm={3:F2} fr={4} | hand q=({5:F2},{6:F2},{7:F2},{8:F2}) i2=({9:F2},{10:F2},{11:F2},{12:F2}) | i2世界 y={13:F3} z={14:F3}",
+                    _enabledJSON.val,
+                    _strengthJSON != null ? _strengthJSON.val : -1f,
+                    strength,
+                    smooth,
+                    fresh,
+                    _latest[0], _latest[1], _latest[2], _latest[3],
+                    _latest[20], _latest[21], _latest[22], _latest[23],
+                    _bones[5].position.y,
+                    _bones[5].position.z
+                );
+                SuperController.LogMessage(msg);
             }
 
             Report();
+        }
+
+        // 诊断：打印实际应用到骨骼的角度
+        const bool DIAG = true;
+        // 直通模式：数据来了立刻满强度、不平滑。调试手感用，调好后改回 false 恢复平滑。
+        // 真实手套/合成数据的 IMU 噪声在直通模式下会表现为高频抖动，默认关闭。
+        const bool DIRECT = false;
+        // 渲染前重写骨骼：绕开 VaM 自己的 LateUpdate 骨骼/蒙皮更新
+        const bool RENDER_WRITE = true;
+
+        // 覆盖检测：Update 里读回 i2 的 localRotation，和上一帧我们写入的值比。
+        // 如果差了，说明 VaM 的其它系统（控制器/物理/蒙皮）在 LateUpdate 之后又写了它。
+        void Update()
+        {
+            if (!DIAG || _bones == null || _bones[5] == null || _latest == null)
+            {
+                return;
+            }
+
+            float now = Time.realtimeSinceStartup;
+            if (now - _lastOverrideCheck < 2f)
+            {
+                return;
+            }
+            _lastOverrideCheck = now;
+
+            float diff = Quaternion.Angle(_bones[5].localRotation, _applied[5]);
+
+            string dazAngles = "n/a";
+            if (_dazBones != null)
+            {
+                try
+                {
+                    var db = _dazBones.GetDAZBone(_activeNames[5]);
+                    if (db != null)
+                    {
+                        var a = db.GetAnglesDegrees();
+                        dazAngles = $"{a.x:F1},{a.y:F1},{a.z:F1}";
+                    }
+                }
+                catch { }
+            }
+
+            if (diff > 1f)
+            {
+                SuperController.LogMessage($"[EIGlove:DIAG] 覆盖检测: lIndex2 当前与写入相差 {diff:F1} 度（LateUpdate 之后有其它系统在写它），DAZBone角度=({dazAngles}) | onPreRender {_preRenderCount} 次，写后差 {_lastPreDiff:F1} 度");
+            }
+            else
+            {
+                SuperController.LogMessage($"[EIGlove:DIAG] 覆盖检测: lIndex2 与写入一致（差 {diff:F1} 度），DAZBone角度=({dazAngles}) | onPreRender {_preRenderCount} 次，写后差 {_lastPreDiff:F1} 度");
+            }
+        }
+
+        void OnPreRenderHook(Camera cam)
+        {
+            if (!RENDER_WRITE || cam == null || cam.cameraType != CameraType.Game)
+            {
+                return;
+            }
+            WriteBonesNow();
+            _preRenderCount++;
+            if (_bones != null && _bones[5] != null && _applied != null)
+            {
+                _lastPreDiff = Quaternion.Angle(_bones[5].localRotation, _applied[5]);
+            }
+        }
+
+        void WriteBonesNow()
+        {
+            if (_bones == null || _applied == null)
+            {
+                return;
+            }
+            for (int i = 0; i < JointCount; i++)
+            {
+                if (_bones[i] != null)
+                {
+                    _bones[i].localRotation = _applied[i];
+                }
+            }
         }
 
         void Report()
@@ -304,6 +626,11 @@ namespace EIGlove
 
         void OnDestroy()
         {
+            if (_renderHookInstalled)
+            {
+                try { Camera.onPreRender -= OnPreRenderHook; } catch { }
+                _renderHookInstalled = false;
+            }
             _running = false;
             try { if (_udp != null) _udp.Close(); } catch { }
             try

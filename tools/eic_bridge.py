@@ -158,7 +158,12 @@ def iter_serial(port: str, baud: int = 115200):
 
 
 def iter_sim(rate_hz: float = 200.0):
-    """合成数据：每根手指独立做正弦弯曲，用来验证链路与观感。"""
+    """合成数据：五指缓慢同步握拳再张开，用来验证链路、骨骼方向与观感。
+
+    早先版本是 1.8Hz、最大 155°、五指不同相位的大幅摆动，直通模式
+    （插件 DIRECT=true）下看起来像抽搐，不适合观察姿态。这里改成
+    0.25Hz、约 35° 的同步慢动作，指间只留一点相位差。
+    """
     t = 0.0
     dt = 1.0 / rate_hz
     while True:
@@ -166,9 +171,8 @@ def iter_sim(rate_hz: float = 200.0):
         for i in range(10):
             finger = i // 2
             is_mid = i % 2
-            amp = 0.25 + 0.15 * finger
-            phase = t * (1.0 + 0.2 * finger) * 2 * math.pi
-            angle = amp * (0.5 + 0.5 * math.sin(phase)) * (1.0 if is_mid else 0.6)
+            phase = t * 2 * math.pi * 0.25 + finger * 0.12
+            angle = 1.2 * (0.5 + 0.5 * math.sin(phase)) * (1.0 if is_mid else 0.6)
             # 绕 -y 轴弯曲，指尖朝掌心（机体系 -z）方向落下
             q = (math.cos(angle / 2), 0.0, -math.sin(angle / 2), 0.0)
             q_rel.append(list(q_norm(q)))
@@ -183,6 +187,40 @@ def iter_sim(rate_hz: float = 200.0):
         t += dt
 
 
+# ---------- 输出平滑 ----------
+
+class JointSmoother:
+    """四元数低通 + 单帧跳变限幅。
+
+    虚拟固件（SITL）没走 GYRO_BIAS / YAW_ZERO 校准时，四元数会带零偏、
+    每帧跳几十度，直接送给 VaM 就是疯狂抽搐。这里在发送前统一压一道：
+    - smooth：每帧向新值靠拢的比例，越大越稳但越迟滞
+    - clamp：单帧允许的最大角度变化，超过就按比例缩短
+    """
+
+    def __init__(self, smooth: float, clamp_deg: float):
+        self.k = max(0.0, min(1.0, 1.0 - smooth))
+        self.clamp = math.radians(max(0.0, clamp_deg))
+        self.state = [None] * N_JOINTS
+
+    def apply(self, joints):
+        out = []
+        for i, q in enumerate(joints):
+            q = q_norm(q)
+            s = self.state[i]
+            if s is None:
+                s = q
+            else:
+                dot = sum(a * b for a, b in zip(s, q))
+                ang = 2.0 * math.acos(max(-1.0, min(1.0, abs(dot))))
+                if self.clamp > 0.0 and ang > self.clamp:
+                    q = q_slerp(s, q, self.clamp / ang)
+                s = q_slerp(s, q, self.k)
+            self.state[i] = s
+            out.append(s)
+        return out
+
+
 # ---------- 主循环 ----------
 
 def main() -> int:
@@ -194,6 +232,12 @@ def main() -> int:
     ap.add_argument("--host", default=UDP_HOST)
     ap.add_argument("--udp-port", type=int, default=UDP_PORT)
     ap.add_argument("--hand", type=int, default=0, choices=[0, 1])
+    ap.add_argument("--smooth", type=float, default=0.5,
+                    help="四元数低通 0~0.95（越大越稳越迟滞），默认 0.5")
+    ap.add_argument("--clamp", type=float, default=20.0,
+                    help="单帧最大角度变化（度），0 表示不限，默认 20")
+    ap.add_argument("--stats", action="store_true",
+                    help="每 2 秒打印 index2 的相邻帧跳变，用来判断数据源抖不抖")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -206,18 +250,38 @@ def main() -> int:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     target = (args.host, args.udp_port)
+    smoother = JointSmoother(args.smooth, args.clamp)
 
     seq = 0
     sent = 0
     t0 = time.monotonic()
     last_report = t0
 
+    stats_prev = None
+    stats_n = 0
+    stats_sum = 0.0
+    stats_max = 0.0
+    stats_bad = 0
+
     for frame in source:
-        joints = frame_to_joints(frame)
+        joints = smoother.apply(frame_to_joints(frame))
         pkt = pack_packet(seq, int(time.monotonic() * 1000), args.hand, joints)
         sock.sendto(pkt, target)
         seq += 1
         sent += 1
+
+        if args.stats:
+            q = joints[5]  # index2
+            if stats_prev is not None:
+                dot = sum(a * b for a, b in zip(stats_prev, q))
+                ang = 2.0 * math.degrees(math.acos(max(-1.0, min(1.0, abs(dot)))))
+                stats_n += 1
+                stats_sum += ang
+                if ang > stats_max:
+                    stats_max = ang
+                if ang > 30.0:
+                    stats_bad += 1
+            stats_prev = q
 
         if args.verbose and sent % 40 == 0:
             n = JOINT_NAMES.index("index2")
@@ -229,6 +293,12 @@ def main() -> int:
         if now - last_report >= 2.0:
             fps = sent / (now - t0)
             print(f"[bridge] 已发 {sent} 包，平均 {fps:.1f} fps -> {args.host}:{args.udp_port}")
+            if args.stats and stats_n > 0:
+                print(f"[stats] i2 每帧跳变 平均 {stats_sum / stats_n:5.1f}°  最大 {stats_max:5.1f}°  超 30° 的帧 {stats_bad}")
+                stats_sum = 0.0
+                stats_max = 0.0
+                stats_n = 0
+                stats_bad = 0
             last_report = now
 
         if args.sim:
