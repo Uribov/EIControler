@@ -1,0 +1,20 @@
+# PlatformIO 构建产物
+.pio/
+
+# ESP-IDF 生成的配置（sdkconfig.defaults 要留）
+sdkconfig.eicontroller
+sdkconfig.old
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# .NET
+bin/
+obj/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
