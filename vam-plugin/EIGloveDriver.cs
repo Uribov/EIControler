@@ -79,6 +79,18 @@ namespace EIGlove
         long _preRenderCount;
         float _lastPreDiff = -1f;
 
+        // 官方手部输出通道（RightHandControl），测试版先只驱动右手食指三节
+        MeshVR.Hands.HandOutput _handOut;
+        bool _handOutReady;
+        bool _outputConnectedWas;
+
+        // 右手关节弹簧（MeshedVR 的 AdjustJointSprings），百分太低时 targetRotation 拉不动骨骼
+        HandControl _handControl;
+        float _springWasPercent;
+        bool _springWasOn;
+        // 食指三节上一帧的 bend，用于单帧限幅
+        readonly float[] _lastBend = new float[3];
+
         long _rxCount;
         long _badCount;
         float _lastReport = -999f;
@@ -127,7 +139,10 @@ namespace EIGlove
                 _lastReport = Time.realtimeSinceStartup;
 
                 FindBones();
+                FindHandOutput();
+                FindHandControl();
                 DiagProbe();
+                DiagHands();
 
                 // 渲染前再写一次骨骼。VaM 的 LateUpdate 里还有自己的骨骼/蒙皮
                 // 更新，普通 LateUpdate 可能被它覆盖；onPreRender 在所有
@@ -239,6 +254,87 @@ namespace EIGlove
             }
         }
 
+        // 诊断 VaM 官方手部管线：HandInput → HandOutput → FingerOutput
+        void DiagHands()
+        {
+            try
+            {
+                var inputs = containingAtom.GetComponentsInChildren<MeshVR.Hands.HandInput>(true);
+                SuperController.LogMessage($"[EIGlove:DIAG] HandInput 数量 {inputs.Length}");
+                for (int i = 0; i < inputs.Length; i++)
+                {
+                    var hi = inputs[i];
+                    if (hi == null)
+                    {
+                        continue;
+                    }
+                    string b = "n/a";
+                    if (hi.indexProximal != null)
+                    {
+                        b = $"{hi.indexProximal.currentBend:F3}/{hi.indexProximal.currentSpread:F3}/{hi.indexProximal.currentTwist:F3}";
+                    }
+                    SuperController.LogMessage($"[EIGlove:DIAG] HandInput[{i}] path={TransformPath(hi.transform)} indexProximal(bend/spread/twist)={b}");
+                }
+
+                var outputs = containingAtom.GetComponentsInChildren<MeshVR.Hands.HandOutput>(true);
+                SuperController.LogMessage($"[EIGlove:DIAG] HandOutput 数量 {outputs.Length}");
+                for (int i = 0; i < outputs.Length; i++)
+                {
+                    var ho = outputs[i];
+                    if (ho == null)
+                    {
+                        continue;
+                    }
+                    string vals = "n/a";
+                    if (ho.indexProximalBendJSON != null)
+                    {
+                        vals = $"i1b={ho.indexProximalBendJSON.val:F3} i1s={ho.indexProximalSpreadJSON.val:F3} i1t={ho.indexProximalTwistJSON.val:F3} i2b={ho.indexMiddleBendJSON.val:F3} i3b={ho.indexDistalBendJSON.val:F3}";
+                    }
+                    string conn = "n/a";
+                    if (ho.inputConnectedJSON != null)
+                    {
+                        conn = $"input={ho.inputConnectedJSON.val} output={(ho.outputConnectedJSON != null ? ho.outputConnectedJSON.val.ToString() : "?")}";
+                    }
+                    SuperController.LogMessage($"[EIGlove:DIAG] HandOutput[{i}] path={TransformPath(ho.transform)} {vals} {conn}");
+                }
+
+                var fingers = containingAtom.GetComponentsInChildren<MeshVR.Hands.FingerOutput>(true);
+                SuperController.LogMessage($"[EIGlove:DIAG] FingerOutput 数量 {fingers.Length}");
+                if (fingers.Length > 0 && fingers[0] != null)
+                {
+                    var fo = fingers[0];
+                    SuperController.LogMessage($"[EIGlove:DIAG] FingerOutput[0] path={TransformPath(fo.transform)} bend={fo.currentBend:F3} spread={fo.currentSpread:F3} twist={fo.currentTwist:F3} bendEnabled={fo.bendEnabled}");
+                }
+
+                // 食指三节的关节状态：joint 是否为空、旋转轴是否被锁、targetRotation 是否在变
+                for (int i = 0; i < fingers.Length; i++)
+                {
+                    var fo = fingers[i];
+                    if (fo == null)
+                    {
+                        continue;
+                    }
+                    string n = fo.transform.name;
+                    if (n != "rIndex1" && n != "rIndex2" && n != "rIndex3")
+                    {
+                        continue;
+                    }
+                    var cj = fo.GetComponent<ConfigurableJoint>();
+                    string j = "null";
+                    if (cj != null)
+                    {
+                        var tr = cj.targetRotation;
+                        j = $"motion=({cj.angularXMotion},{cj.angularYMotion},{cj.angularZMotion}) target=({tr.x:F3},{tr.y:F3},{tr.z:F3},{tr.w:F3})";
+                    }
+                    SuperController.LogMessage($"[EIGlove:DIAG] {n} currentBend={fo.currentBend:F2} joint={j}");
+                }
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove:DIAG] DiagHands 失败: " + e);
+            }
+        }
+
         static string TransformPath(Transform t)
         {
             string s = t.name;
@@ -249,6 +345,104 @@ namespace EIGlove
                 guard++;
             }
             return s;
+        }
+
+        // 找官方手部输出通道（RightHandControl / LeftHandControl）
+        void FindHandOutput()
+        {
+            try
+            {
+                var outs = containingAtom.GetComponentsInChildren<MeshVR.Hands.HandOutput>(true);
+                for (int i = 0; i < outs.Length; i++)
+                {
+                    var ho = outs[i];
+                    if (ho == null)
+                    {
+                        continue;
+                    }
+                    if (TransformPath(ho.transform).Contains("RightHandControl"))
+                    {
+                        _handOut = ho;
+                        break;
+                    }
+                }
+
+                if (_handOut != null)
+                {
+                    if (_handOut.outputConnectedJSON != null)
+                    {
+                        _outputConnectedWas = _handOut.outputConnectedJSON.val;
+                        _handOut.outputConnectedJSON.val = true;
+                    }
+                    _handOutReady = true;
+                    string range = "n/a";
+                    if (_handOut.indexProximalBendJSON != null)
+                    {
+                        range = $"[{_handOut.indexProximalBendJSON.min:F1}, {_handOut.indexProximalBendJSON.max:F1}]";
+                    }
+                    SuperController.LogMessage($"[EIGlove] HandOutput 找到 {TransformPath(_handOut.transform)}，output 已连接，indexBend 范围={range}");
+                }
+                else
+                {
+                    SuperController.LogError("[EIGlove] 未找到 RightHandControl 的 HandOutput");
+                }
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove] FindHandOutput 失败: " + e.Message);
+            }
+        }
+
+        // 找右手 HandControl，并把关节弹簧调到最大——FingerOutput 只设 targetRotation，
+        // 真正拉动骨骼的是 AdjustJointSprings.percent
+        void FindHandControl()
+        {
+            try
+            {
+                var hcs = containingAtom.GetComponentsInChildren<HandControl>(true);
+                SuperController.LogMessage($"[EIGlove] HandControl 数量 {hcs.Length}");
+                for (int i = 0; i < hcs.Length; i++)
+                {
+                    var hc = hcs[i];
+                    if (hc == null)
+                    {
+                        continue;
+                    }
+                    string boneName = (hc.indexProximalBone != null) ? hc.indexProximalBone.transform.name : "null";
+                    string springPct = (hc.handJointSprings != null) ? hc.handJointSprings.percent.ToString("F1") : "null";
+                    SuperController.LogMessage($"[EIGlove] HandControl[{i}] path={TransformPath(hc.transform)} indexProximalBone={boneName} springsPercent={springPct}");
+                    if (boneName.StartsWith("r"))
+                    {
+                        _handControl = hc;
+                    }
+                }
+
+                if (_handControl != null)
+                {
+                    if (_handControl.handJointSprings != null)
+                    {
+                        _springWasPercent = _handControl.handJointSprings.percent;
+                        _springWasOn = _handControl.handJointSprings.on;
+                        _handControl.handJointSprings.on = true;
+                        // 100 才拉得动；全身抽改用增益和单帧限幅来压，而不是降弹簧
+                        _handControl.handJointSprings.percent = 100f;
+                        _handControl.handJointSprings.ResyncSprings();
+                        SuperController.LogMessage($"[EIGlove] 右手关节弹簧 percent {_springWasPercent:F1} -> 100，已 Resync");
+                    }
+                    if (_handControl.handGraspStrengthJSON != null)
+                    {
+                        SuperController.LogMessage($"[EIGlove] 右手握力 {_handControl.handGraspStrengthJSON.val:F2}");
+                    }
+                }
+                else
+                {
+                    SuperController.LogError("[EIGlove] 未找到右手的 HandControl");
+                }
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove] FindHandControl 失败: " + e.Message);
+            }
         }
 
         // 一次性诊断：确认 _bones[5]（index2）到底是什么节点，是否参与蒙皮
@@ -493,10 +687,18 @@ namespace EIGlove
                 // 目标先按强度插值，再按平滑系数逼近，避免抖动
                 Quaternion blended = Quaternion.Slerp(_restRotation[i], goal, strength);
                 _applied[i] = Quaternion.Slerp(_applied[i], blended, slerpK);
-                if (_writing)
+                if (_writing && !HANDOUT_TEST)
                 {
                     bone.localRotation = _applied[i];
                 }
+            }
+
+            // 数据驱动：右手食指三节走官方 HandOutput 通道
+            if (HANDOUT_TEST && _handOutReady && _handOut != null && _applied != null)
+            {
+                WriteFingerBend(_applied[4], _handOut.indexProximalBendJSON, 0);
+                WriteFingerBend(_applied[5], _handOut.indexMiddleBendJSON, 1);
+                WriteFingerBend(_applied[6], _handOut.indexDistalBendJSON, 2);
             }
 
             // 每帧打日志会拖慢 VaM（180fps 时磁盘/面板会被刷爆），限到约 6Hz
@@ -527,6 +729,12 @@ namespace EIGlove
         const bool DIRECT = false;
         // 渲染前重写骨骼：绕开 VaM 自己的 LateUpdate 骨骼/蒙皮更新
         const bool RENDER_WRITE = true;
+        // 测试模式：只驱动右手食指三节（HandOutput JSON），停掉直接写骨骼
+        const bool HANDOUT_TEST = true;
+        // 四元数 → bend 的放大系数
+        const float BEND_GAIN = 0.8f;
+        // 单帧 bend 最大变化量（度），压物理链冲击
+        const float BEND_STEP_MAX = 5f;
 
         // 覆盖检测：Update 里读回 i2 的 localRotation，和上一帧我们写入的值比。
         // 如果差了，说明 VaM 的其它系统（控制器/物理/蒙皮）在 LateUpdate 之后又写了它。
@@ -600,6 +808,47 @@ namespace EIGlove
             }
         }
 
+        // 把相对四元数转成 HandOutput 的 bend（角度），带放大系数和单帧限幅
+        void WriteFingerBend(Quaternion q, JSONStorableFloat json, int seg)
+        {
+            if (json == null || seg < 0 || seg >= _lastBend.Length)
+            {
+                return;
+            }
+            float z = q.eulerAngles.z;
+            if (z > 180f)
+            {
+                z -= 360f;
+            }
+            float bend = -z * BEND_GAIN;
+
+            // 关节极限之外的幅度直接放弃，避免物理把手指折崩
+            bend = Mathf.Clamp(bend, -35f, 35f);
+
+            // 单帧限幅：目标变化再快也只让它每帧走 BEND_STEP_MAX 度，
+            // 避免 targetRotation 突变把力传给整条物理链
+            float last = _lastBend[seg];
+            if (bend > last + BEND_STEP_MAX)
+            {
+                bend = last + BEND_STEP_MAX;
+            }
+            else if (bend < last - BEND_STEP_MAX)
+            {
+                bend = last - BEND_STEP_MAX;
+            }
+            _lastBend[seg] = bend;
+
+            if (bend < json.min)
+            {
+                bend = json.min;
+            }
+            if (bend > json.max)
+            {
+                bend = json.max;
+            }
+            json.val = bend;
+        }
+
         void Report()
         {
             float now = Time.realtimeSinceStartup;
@@ -632,6 +881,19 @@ namespace EIGlove
                 _renderHookInstalled = false;
             }
             _running = false;
+            if (_handOut != null && _handOut.outputConnectedJSON != null)
+            {
+                try { _handOut.outputConnectedJSON.val = _outputConnectedWas; } catch { }
+            }
+            if (_handControl != null && _handControl.handJointSprings != null)
+            {
+                try
+                {
+                    _handControl.handJointSprings.percent = _springWasPercent;
+                    _handControl.handJointSprings.on = _springWasOn;
+                }
+                catch { }
+            }
             try { if (_udp != null) _udp.Close(); } catch { }
             try
             {

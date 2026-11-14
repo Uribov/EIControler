@@ -1,22 +1,22 @@
-// EIControlerPose —— 手部姿态控制器
+// EIControlerPose —— 手部姿态编辑器（3D）
 //
-// 在 2D 骨骼模型上拖指尖，按 EIGV 协议把 16 关节四元数发给 VaM 插件
-// （默认 127.0.0.1:9001，200Hz）。用来手动验证 VaM 端的骨骼映射和朝向补偿。
+// 坐标标定和固件一致：x+ 指向肘部，y+ 指向身体右侧，z+ 指向天空。
+// 圆柱指节 + 球关节的手部模型；拖动任意指节调整该关节的局部旋转，
+// 拖动右下角三轴控制球调整整只手；右键拖动转视角。200Hz 按 EIGV 协议发送。
 //
-// 编译（Windows 自带 .NET Framework 编译器，无需额外依赖）：
+// 编译（系统自带 .NET Framework 编译器）：
 //   csc /target:winexe /optimize+ /r:System.Windows.Forms.dll /r:System.Drawing.dll
-//       /out:EIControlerPose.exe EIControlerPose.cs
-//
-// 协议：4 字节 "EIGV" + <HBBII>(ver, hand, 0, seq, ts_ms) + 16 × 4 float，共 272 字节。
+//       /r:System.Numerics.dll /out:EIControlerPose.exe EIControlerPose.cs
 
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 using System.Windows.Forms;
+using SN = System.Numerics;
 
 static class Program
 {
@@ -26,31 +26,15 @@ static class Program
         string host = "127.0.0.1";
         int port = 9001;
         int hand = 1;
-        string poseArg = null;
-
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--host" && i + 1 < args.Length) host = args[++i];
             else if (args[i] == "--udp-port" && i + 1 < args.Length) int.TryParse(args[++i], out port);
             else if (args[i] == "--hand" && i + 1 < args.Length) int.TryParse(args[++i], out hand);
-            else if (args[i] == "--pose" && i + 1 < args.Length) poseArg = args[++i];
         }
-
-        float[] initBend = null;
-        if (!string.IsNullOrEmpty(poseArg))
-        {
-            string[] parts = poseArg.Split(',');
-            initBend = new float[5];
-            for (int i = 0; i < 5 && i < parts.Length; i++)
-            {
-                float v;
-                if (float.TryParse(parts[i], out v)) initBend[i] = v;
-            }
-        }
-
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new PoseForm(host, port, hand, initBend));
+        Application.Run(new PoseForm(host, port, hand));
     }
 }
 
@@ -60,87 +44,84 @@ class PoseForm : Form
     const ushort VERSION = 1;
     const double SEND_HZ = 200.0;
 
-    static readonly string[] FINGER_NAMES = { "拇指", "食指", "中指", "无名指", "小指" };
-    static readonly int[] BASE_JOINT = { 1, 4, 7, 10, 13 };   // thumb,index,middle,ring,pinky
-    static readonly float[] SEG_BEND = { 45f, 75f, 55f };     // 每节最大弯曲（度）
+    static readonly SN.Vector3 ELBOW = new SN.Vector3(1, 0, 0);
+    static readonly SN.Vector3 UP = new SN.Vector3(0, 0, 1);
 
-    static readonly PointF[] BASE_POS = {
-        new PointF(285f, 490f),
-        new PointF(330f, 425f),
-        new PointF(395f, 415f),
-        new PointF(460f, 425f),
-        new PointF(525f, 440f),
+    class Bone
+    {
+        public string Name;
+        public int Parent;
+        public SN.Vector3 Offset;
+        public SN.Vector3 Axis;
+        public float Length;
+        public float Width;
+        public SN.Vector3 BoxCenter;  // 手掌长方体中心（相对 hand）
+        public SN.Vector3 BoxHalf;    // 非零时画扁长方体（手掌）
+        public SN.Quaternion Rot = SN.Quaternion.Identity;
+    }
+
+    readonly Bone[] bones = new Bone[16];
+    readonly string[] names = {
+        "hand", "thumb1","thumb2","thumb3", "index1","index2","index3",
+        "middle1","middle2","middle3", "ring1","ring2","ring3", "pinky1","pinky2","pinky3"
     };
-    static readonly float[] BASE_DEG = { -105f, -90f, -90f, -90f, -90f };
-    static readonly float[][] LENGTHS = {
-        new float[] { 62f, 50f, 40f },
-        new float[] { 70f, 55f, 45f },
-        new float[] { 76f, 58f, 46f },
-        new float[] { 70f, 55f, 45f },
-        new float[] { 60f, 48f, 40f },
+    static readonly Color[] fingerColors = {
+        Color.FromArgb(255, 120, 120), // hand
+        Color.FromArgb(255, 160, 90),  // thumb
+        Color.FromArgb(255, 200, 80),  // index
+        Color.FromArgb(150, 220, 90),  // middle
+        Color.FromArgb(80, 200, 200),  // ring
+        Color.FromArgb(120, 150, 255), // pinky
     };
 
-    static readonly Color BG = Color.FromArgb(30, 30, 40);
-    static readonly Color PALM_FILL = Color.FromArgb(58, 58, 74);
-    static readonly Color PALM_LINE = Color.FromArgb(90, 90, 112);
-    static readonly Color BONE = Color.FromArgb(232, 232, 240);
-    static readonly Color JOINT = Color.FromArgb(142, 197, 255);
-    static readonly Color TIP = Color.FromArgb(255, 211, 77);
-    static readonly Color TIP_DRAG = Color.FromArgb(255, 122, 69);
-    static readonly Color TEXT = Color.FromArgb(200, 200, 216);
-    static readonly Color DIM = Color.FromArgb(138, 138, 160);
-
-    readonly float[] bend = new float[5];
-    readonly object bendLock = new object();
-    int drag = -1;
-    long sent;
-    float rate;
-    long lastCount;
-    DateTime lastRateTime = DateTime.Now;
+    SN.Quaternion handRot = SN.Quaternion.Identity;
+    int dragBone = -1;
+    bool dragGizmo = false;
+    Point dragLast;
+    float yaw = 0f, pitch = 1.45f;
+    float distance = 2.0f;
 
     readonly string host;
     readonly int port;
     readonly int hand;
     volatile bool running = true;
     Thread sender;
+    long sent;
+    float rate;
+    DateTime lastRate = DateTime.Now;
+    long lastCount;
 
-    readonly Font font;
-    readonly Font small;
+    readonly Font font = new Font("Microsoft YaHei UI", 10f);
+    readonly Font small = new Font("Microsoft YaHei UI", 8.5f);
     readonly System.Windows.Forms.Timer timer;
 
-    public PoseForm(string host, int port, int hand, float[] initBend)
+    public PoseForm(string host, int port, int hand)
     {
         this.host = host;
         this.port = port;
         this.hand = hand;
 
-        if (initBend != null)
-        {
-            for (int i = 0; i < 5; i++) bend[i] = initBend[i];
-        }
-
-        Text = "EIGlove 手部姿态控制器";
-        ClientSize = new Size(760, 620);
+        Text = "EIGlove 手部姿态编辑器（3D） · x+肘 / y+右 / z+天（同固件机体系）";
+        ClientSize = new Size(1000, 760);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
-        BackColor = BG;
+        BackColor = Color.FromArgb(22, 22, 28);
         DoubleBuffered = true;
         KeyPreview = true;
 
-        font = new Font("Microsoft YaHei UI", 11f);
-        small = new Font("Microsoft YaHei UI", 9f);
+        InitSkeleton();
 
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 33;
         timer.Tick += delegate
         {
-            float nowRate = (float)((sent - lastCount) / Math.Max((DateTime.Now - lastRateTime).TotalSeconds, 0.001));
-            if ((DateTime.Now - lastRateTime).TotalSeconds >= 0.5)
+            DateTime now = DateTime.Now;
+            if ((now - lastRate).TotalSeconds >= 0.5)
             {
-                rate = nowRate;
+                rate = (float)((sent - lastCount) / (now - lastRate).TotalSeconds);
                 lastCount = sent;
-                lastRateTime = DateTime.Now;
+                lastRate = now;
             }
             Invalidate();
         };
@@ -151,44 +132,388 @@ class PoseForm : Form
         sender.Start();
     }
 
-    // ---------- 几何 ----------
+    // ---------- 骨架 ----------
 
-    PointF[] FK(int finger, float c)
+    void InitSkeleton()
     {
-        PointF[] pts = new PointF[4];
-        pts[0] = BASE_POS[finger];
-        float acc = 0f;
-        float baseDeg = BASE_DEG[finger];
-        for (int seg = 0; seg < 3; seg++)
+        // 手掌：扁平长方体，手背朝 +z（天空），手指朝 -x；y 方向是手宽（拇指 -y，小指 +y）
+        bones[0] = new Bone
         {
-            acc += SEG_BEND[seg] * c;
-            double ang = (baseDeg + acc) * Math.PI / 180.0;
-            float len = LENGTHS[finger][seg];
-            pts[seg + 1] = new PointF(
-                pts[seg].X + (float)(len * Math.Cos(ang)),
-                pts[seg].Y + (float)(len * Math.Sin(ang)));
+            Name = "hand", Parent = -1, Offset = SN.Vector3.Zero, Axis = -ELBOW,
+            Length = 0.075f, Width = 0.075f,
+            BoxCenter = new SN.Vector3(-0.0375f, -0.0035f, 0f),
+            BoxHalf = new SN.Vector3(0.0375f, 0.050f, 0.012f)
+        };
+
+        // 拇指：从手掌左侧(-y)边缘斜着伸出
+        AddChain(1, 0, new SN.Vector3(-0.012f, -0.045f, 0f), SN.Vector3.Normalize(new SN.Vector3(-0.55f, -0.83f, 0f)),
+                 new float[] { 0.034f, 0.03f, 0.024f }, new float[] { 0.022f, 0.019f, 0.016f });
+        // 四指等距分布：间距 0.024，根都在手掌 -x 端面内，中指严格沿 -x
+        AddChain(4, 0, new SN.Vector3(-0.075f, -0.039f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, -0.22f, 0f)),
+                 new float[] { 0.042f, 0.032f, 0.026f }, new float[] { 0.021f, 0.018f, 0.015f });
+        AddChain(7, 0, new SN.Vector3(-0.075f, -0.015f, 0f), -ELBOW,
+                 new float[] { 0.045f, 0.034f, 0.027f }, new float[] { 0.022f, 0.019f, 0.015f });
+        AddChain(10, 0, new SN.Vector3(-0.075f, 0.009f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.22f, 0f)),
+                 new float[] { 0.042f, 0.032f, 0.026f }, new float[] { 0.021f, 0.018f, 0.015f });
+        AddChain(13, 0, new SN.Vector3(-0.073f, 0.033f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.42f, 0f)),
+                 new float[] { 0.034f, 0.026f, 0.021f }, new float[] { 0.019f, 0.016f, 0.013f });
+    }
+
+    void AddChain(int start, int parent, SN.Vector3 offset, SN.Vector3 axis, float[] lengths, float[] widths)
+    {
+        int p = parent;
+        for (int i = 0; i < 3; i++)
+        {
+            int idx = start + i;
+            bones[idx] = new Bone
+            {
+                Name = names[idx],
+                Parent = p,
+                Offset = (i == 0) ? offset : bones[p].Axis * bones[p].Length,
+                Axis = axis,
+                Length = lengths[i],
+                Width = widths[i]
+            };
+            p = idx;
+        }
+    }
+
+    // ---------- 变换 ----------
+
+    SN.Quaternion WorldRot(int i, SN.Quaternion hand)
+    {
+        int p = bones[i].Parent;
+        return p < 0 ? hand : SN.Quaternion.Normalize(WorldRot(p, hand) * bones[i].Rot);
+    }
+
+    SN.Vector3 WorldPos(int i, SN.Quaternion hand)
+    {
+        int p = bones[i].Parent;
+        if (p < 0) return SN.Vector3.Zero;
+        return WorldPos(p, hand) + SN.Vector3.Transform(bones[i].Offset, WorldRot(p, hand));
+    }
+
+    // ---------- 相机 ----------
+
+    SN.Vector3 Eye()
+    {
+        SN.Vector3 dir = new SN.Vector3(
+            (float)(Math.Cos(pitch) * Math.Cos(yaw)),
+            (float)(Math.Cos(pitch) * Math.Sin(yaw)),
+            (float)Math.Sin(pitch));
+        return dir * distance;
+    }
+
+    void CameraBasis(out SN.Vector3 eye, out SN.Vector3 right, out SN.Vector3 up, out SN.Vector3 forward)
+    {
+        eye = Eye();
+        forward = SN.Vector3.Normalize(-eye);
+        SN.Vector3 cr = SN.Vector3.Cross(forward, UP);
+        if (cr.Length() < 0.01f) cr = SN.Vector3.Cross(forward, SN.Vector3.UnitX);
+        right = SN.Vector3.Normalize(cr);
+        up = SN.Vector3.Cross(right, forward);
+    }
+
+    PointF Project(SN.Vector3 p, out float depth)
+    {
+        SN.Vector3 eye, right, up, forward;
+        CameraBasis(out eye, out right, out up, out forward);
+        SN.Vector3 rel = p - eye;
+        float scale = 1300f;
+        float u = SN.Vector3.Dot(rel, right) * scale + ClientSize.Width * 0.5f;
+        float v = -SN.Vector3.Dot(rel, up) * scale + ClientSize.Height * 0.5f;
+        depth = SN.Vector3.Dot(rel, forward);
+        return new PointF(u, v);
+    }
+
+    // ---------- 渲染 ----------
+
+    class Face
+    {
+        public PointF[] Pts;
+        public float Depth;
+        public Color Fill;
+        public Color Edge;
+        public float EdgeWidth;
+    }
+
+    static Color Shade(Color c, float s)
+    {
+        return Color.FromArgb(c.A,
+            Math.Min(255, (int)(c.R * s)),
+            Math.Min(255, (int)(c.G * s)),
+            Math.Min(255, (int)(c.B * s)));
+    }
+
+    static Color FingerColor(int idx)
+    {
+        int f = idx <= 0 ? 0 : (idx - 1) / 3 + 1;
+        return fingerColors[Math.Min(f, fingerColors.Length - 1)];
+    }
+
+    void AddCylinder(List<Face> faces, SN.Vector3 a, SN.Vector3 b, float r, int idx, SN.Vector3 light, bool selected)
+    {
+        SN.Vector3 dir = SN.Vector3.Normalize(b - a);
+        SN.Vector3 helper = Math.Abs(dir.Z) < 0.9f ? SN.Vector3.UnitZ : SN.Vector3.UnitY;
+        SN.Vector3 u = SN.Vector3.Normalize(SN.Vector3.Cross(dir, helper));
+        SN.Vector3 v = SN.Vector3.Cross(dir, u);
+        const int N = 12;
+        Color baseCol = FingerColor(idx);
+        if (selected) baseCol = Color.FromArgb(255, 255, 255, 255);
+
+        for (int i = 0; i < N; i++)
+        {
+            float a0 = (float)(i * Math.PI * 2 / N);
+            float a1 = (float)((i + 1) * Math.PI * 2 / N);
+            float am = (a0 + a1) * 0.5f;
+            SN.Vector3 n = u * (float)Math.Cos(am) + v * (float)Math.Sin(am);
+            SN.Vector3 p0 = a + (u * (float)Math.Cos(a0) + v * (float)Math.Sin(a0)) * r;
+            SN.Vector3 p1 = a + (u * (float)Math.Cos(a1) + v * (float)Math.Sin(a1)) * r;
+            SN.Vector3 p2 = b + (u * (float)Math.Cos(a1) + v * (float)Math.Sin(a1)) * r;
+            SN.Vector3 p3 = b + (u * (float)Math.Cos(a0) + v * (float)Math.Sin(a0)) * r;
+            float shade = 0.42f + 0.62f * Math.Max(0f, SN.Vector3.Dot(n, light));
+            float d0, d1, d2, d3;
+            PointF q0 = Project(p0, out d0);
+            PointF q1 = Project(p1, out d1);
+            PointF q2 = Project(p2, out d2);
+            PointF q3 = Project(p3, out d3);
+            faces.Add(new Face
+            {
+                Pts = new[] { q0, q1, q2, q3 },
+                Depth = (d0 + d1 + d2 + d3) * 0.25f,
+                Fill = Shade(baseCol, shade),
+                Edge = Color.FromArgb(22, 20, 20, 30),
+                EdgeWidth = 0.6f
+            });
+        }
+    }
+
+    void AddBox(List<Face> faces, SN.Vector3 center, SN.Vector3 half, SN.Quaternion rot, int idx, SN.Vector3 light, bool selected)
+    {
+        int[][] quads = {
+            new[]{0,1,3,2}, new[]{4,6,7,5}, new[]{0,2,6,4},
+            new[]{1,5,7,3}, new[]{0,4,5,1}, new[]{2,3,7,6}
+        };
+        SN.Vector3[] normals = {
+            new SN.Vector3(0,0,-1), new SN.Vector3(0,0,1), new SN.Vector3(-1,0,0),
+            new SN.Vector3(1,0,0), new SN.Vector3(0,-1,0), new SN.Vector3(0,1,0)
+        };
+        Color baseCol = FingerColor(idx);
+        if (selected) baseCol = Color.White;
+        for (int f = 0; f < 6; f++)
+        {
+            SN.Vector3 n = SN.Vector3.Transform(normals[f], rot);
+            float shade = 0.42f + 0.62f * Math.Max(0f, SN.Vector3.Dot(n, light));
+            PointF[] pts = new PointF[4];
+            float dsum = 0;
+            for (int k = 0; k < 4; k++)
+            {
+                int c = quads[f][k];
+                SN.Vector3 v = new SN.Vector3(
+                    ((c & 1) == 0 ? -half.X : half.X),
+                    ((c & 2) == 0 ? -half.Y : half.Y),
+                    ((c & 4) == 0 ? -half.Z : half.Z));
+                float d;
+                pts[k] = Project(center + SN.Vector3.Transform(v, rot), out d);
+                dsum += d;
+            }
+            faces.Add(new Face
+            {
+                Pts = pts,
+                Depth = dsum * 0.25f,
+                Fill = Shade(baseCol, shade),
+                Edge = Color.FromArgb(26, 20, 20, 30),
+                EdgeWidth = 0.7f
+            });
+        }
+    }
+
+    void AddSphere(List<Face> faces, SN.Vector3 c, float r, Color col, float depthBias)
+    {
+        float d;
+        PointF p = Project(c, out d);
+        float rr = Math.Max(3.0f, r * 1300f);
+        faces.Add(new Face
+        {
+            Pts = CirclePts(p, rr),
+            Depth = d + depthBias,
+            Fill = Shade(col, 0.85f),
+            Edge = Color.FromArgb(90, 20, 20, 30),
+            EdgeWidth = 1f
+        });
+        // 高光
+        faces.Add(new Face
+        {
+            Pts = CirclePts(new PointF(p.X - rr * 0.28f, p.Y - rr * 0.28f), rr * 0.42f),
+            Depth = d + depthBias - 0.002f,
+            Fill = Color.FromArgb(110, 255, 255, 255),
+            Edge = Color.Transparent,
+            EdgeWidth = 0f
+        });
+    }
+
+    static PointF[] CirclePts(PointF c, float r)
+    {
+        PointF[] pts = new PointF[20];
+        for (int i = 0; i < 20; i++)
+        {
+            double a = i * Math.PI * 2 / 20;
+            pts[i] = new PointF(c.X + (float)(Math.Cos(a) * r), c.Y + (float)(Math.Sin(a) * r));
         }
         return pts;
     }
 
-    float BendForPoint(int finger, float mx, float my)
+    protected override void OnPaint(PaintEventArgs e)
     {
-        float bestC = 0f;
-        float bestD = float.MaxValue;
-        for (int k = 0; k <= 100; k++)
+        Graphics g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(BackColor);
+
+        // 固定的世界坐标轴：原点在手腕，x+ 肘、y+ 右、z+ 天（与固件一致）
+        DrawWorldAxes(g);
+
+        SN.Quaternion hand = handRot;
+        List<Face> faces = new List<Face>();
+        SN.Vector3 light = SN.Vector3.Normalize(new SN.Vector3(-0.45f, -0.55f, 1f));
+
+        for (int i = 0; i < 16; i++)
         {
-            float c = k / 100f;
-            PointF tip = FK(finger, c)[3];
-            float dx = tip.X - mx;
-            float dy = tip.Y - my;
-            float d = dx * dx + dy * dy;
-            if (d < bestD)
+            Bone b = bones[i];
+            SN.Vector3 pos = WorldPos(i, hand);
+            SN.Quaternion rot = WorldRot(i, hand);
+            SN.Vector3 axis = SN.Vector3.Transform(b.Axis, rot);
+            SN.Vector3 start = pos;
+            SN.Vector3 end = pos + axis * b.Length;
+
+            if (b.BoxHalf != SN.Vector3.Zero)
             {
-                bestD = d;
-                bestC = c;
+                SN.Vector3 center = pos + SN.Vector3.Transform(b.BoxCenter, rot);
+                AddBox(faces, center, b.BoxHalf, rot, i, light, dragBone == i);
+            }
+            else
+            {
+                AddCylinder(faces, start, end, b.Width * 0.5f, i, light, dragBone == i);
+            }
+            AddSphere(faces, start, b.Width * 0.46f, FingerColor(i), 0f);
+            if (i == 3 || i == 6 || i == 9 || i == 12 || i == 15)
+            {
+                AddSphere(faces, end, b.Width * 0.4f, FingerColor(i), -0.001f);
             }
         }
-        return bestC;
+
+        faces.Sort(delegate (Face x, Face y) { return y.Depth.CompareTo(x.Depth); });
+        foreach (Face f in faces)
+        {
+            using (SolidBrush br = new SolidBrush(f.Fill))
+            {
+                g.FillPolygon(br, f.Pts);
+                if (f.EdgeWidth > 0f)
+                {
+                    using (Pen pen = new Pen(f.Edge, f.EdgeWidth))
+                    {
+                        g.DrawPolygon(pen, f.Pts);
+                    }
+                }
+            }
+        }
+
+        DrawGizmo(g);
+        DrawHud(g);
+        DrawJointInfo(g);
+    }
+
+    // ---------- 世界坐标轴（固定原点，标定基准） ----------
+
+    void DrawWorldAxes(Graphics g)
+    {
+        SN.Vector3 o = SN.Vector3.Zero;
+        SN.Vector3[] dirs = { SN.Vector3.UnitX, SN.Vector3.UnitY, SN.Vector3.UnitZ };
+        Color[] cols = { Color.FromArgb(230, 80, 80), Color.FromArgb(80, 220, 100), Color.FromArgb(90, 150, 255) };
+        string[] labels = { "x+ 肘", "y+ 右", "z+ 天" };
+        float dummy;
+        PointF p0 = Project(o, out dummy);
+        for (int i = 0; i < 3; i++)
+        {
+            float d1;
+            PointF p1 = Project(dirs[i] * 0.16f, out d1);
+            using (Pen pen = new Pen(cols[i], 2.5f))
+            {
+                g.DrawLine(pen, p0, p1);
+            }
+            using (SolidBrush br = new SolidBrush(cols[i]))
+            {
+                g.FillEllipse(br, p1.X - 4, p1.Y - 4, 8, 8);
+                g.DrawString(labels[i], small, br, p1.X + 6f, p1.Y - 6f);
+            }
+        }
+        using (SolidBrush br = new SolidBrush(Color.FromArgb(235, 255, 255, 255)))
+        {
+            g.FillEllipse(br, p0.X - 4, p0.Y - 4, 8, 8);
+        }
+    }
+
+    // ---------- HUD ----------
+
+    void DrawGizmo(Graphics g)
+    {
+        Rectangle area = new Rectangle(ClientSize.Width - 220, ClientSize.Height - 220, 200, 200);
+        using (SolidBrush back = new SolidBrush(Color.FromArgb(150, 8, 8, 14)))
+            g.FillRectangle(back, area);
+
+        PointF c = new PointF(area.X + area.Width * 0.5f, area.Y + area.Height * 0.5f);
+        float R = 62f;
+        SN.Quaternion hand = handRot;
+        SN.Vector3[] axes = { SN.Vector3.UnitX, SN.Vector3.UnitY, SN.Vector3.UnitZ };
+        Color[] cols = { Color.FromArgb(240, 80, 80), Color.FromArgb(80, 235, 100), Color.FromArgb(90, 150, 255) };
+        string[] labels = { "x+肘", "y+右", "z+天" };
+        for (int i = 0; i < 3; i++)
+        {
+            SN.Vector3 dir = SN.Vector3.Transform(axes[i], hand);
+            float u = SN.Vector3.Dot(dir, new SN.Vector3(1, 0, 0)) * R;
+            float v = -SN.Vector3.Dot(dir, new SN.Vector3(0, 0, 1)) * R;
+            using (Pen pen = new Pen(cols[i], 3f))
+                g.DrawLine(pen, c, new PointF(c.X + u, c.Y + v));
+            using (SolidBrush br = new SolidBrush(cols[i]))
+                g.FillEllipse(br, c.X + u - 5, c.Y + v - 5, 10, 10);
+            using (SolidBrush br = new SolidBrush(Color.FromArgb(200, 220, 220, 235)))
+                g.DrawString(labels[i], small, br, c.X + u + 7, c.Y + v - 8);
+        }
+        using (Pen pen = new Pen(Color.FromArgb(150, 190, 190, 210), 1.2f))
+            g.DrawEllipse(pen, c.X - R, c.Y - R, R * 2, R * 2);
+    }
+
+    void DrawHud(Graphics g)
+    {
+        using (SolidBrush br = new SolidBrush(Color.FromArgb(220, 220, 235)))
+        {
+            g.DrawString(
+                string.Format("UDP {0}:{1}   {2} Hz   已发 {3} 包", host, port, (int)rate, sent),
+                font, br, new PointF(16, 12));
+            g.DrawString(
+                "拖指节=转该关节   拖右下角三轴球=转整手   右键拖=转视角   R=复位   Esc=退出",
+                small, br, new PointF(16, 40));
+            g.DrawString("坐标：x+ 肘部 / y+ 身体右 / z+ 天空（与固件机体系一致）", small, br, new PointF(16, 60));
+        }
+    }
+
+    void DrawJointInfo(Graphics g)
+    {
+        int y = 90;
+        using (SolidBrush br = new SolidBrush(Color.FromArgb(180, 200, 200, 215)))
+        {
+            g.DrawString("关节（相对父关节的旋转角）", small, br, new PointF(16, y));
+            y += 20;
+            for (int i = 1; i < 16; i++)
+            {
+                SN.Quaternion q = bones[i].Rot;
+                float ang = (float)(2.0 * Math.Acos(Math.Min(1.0, Math.Abs(q.W))) * 180.0 / Math.PI);
+                Color c = FingerColor(i);
+                using (SolidBrush cb = new SolidBrush(c))
+                    g.DrawString(names[i], small, cb, new PointF(16, y));
+                g.DrawString(string.Format("{0,6:F1}°", ang), small, br, new PointF(110, y));
+                y += 16;
+            }
+        }
     }
 
     // ---------- 交互 ----------
@@ -196,34 +521,69 @@ class PoseForm : Form
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        float bestD = 40f * 40f;
-        int best = -1;
-        for (int i = 0; i < 5; i++)
+        dragLast = e.Location;
+
+        if (e.Button == MouseButtons.Right)
         {
-            PointF tip = FK(i, bend[i])[3];
-            float dx = tip.X - e.X;
-            float dy = tip.Y - e.Y;
-            float d = dx * dx + dy * dy;
-            if (d < bestD)
+            return;
+        }
+
+        if (new Rectangle(ClientSize.Width - 220, ClientSize.Height - 220, 200, 200).Contains(e.Location))
+        {
+            dragGizmo = true;
+            return;
+        }
+
+        float best = 24f;
+        int bestIdx = -1;
+        SN.Quaternion hand = handRot;
+        for (int i = 0; i < 16; i++)
+        {
+            float d;
+            PointF p = Project(WorldPos(i, hand), out d);
+            float dx = p.X - e.X;
+            float dy = p.Y - e.Y;
+            float dist = (float)Math.Sqrt(dx * dx + dy * dy);
+            if (dist < best)
             {
-                bestD = d;
-                best = i;
+                best = dist;
+                bestIdx = i;
             }
         }
-        if (best >= 0)
-        {
-            drag = best;
-            Invalidate();
-        }
+        dragBone = bestIdx;
+        Invalidate();
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        if (drag < 0) return;
-        lock (bendLock)
+        float dx = e.X - dragLast.X;
+        float dy = e.Y - dragLast.Y;
+        dragLast = e.Location;
+
+        if (e.Button == MouseButtons.Right)
         {
-            bend[drag] = BendForPoint(drag, e.X, e.Y);
+            yaw += dx * 0.01f;
+            pitch += dy * 0.01f;
+            pitch = Math.Max(-1.45f, Math.Min(1.45f, pitch));
+            Invalidate();
+            return;
+        }
+
+        if (e.Button != MouseButtons.Left) return;
+
+        SN.Vector3 eye, right, up, forward;
+        CameraBasis(out eye, out right, out up, out forward);
+        SN.Quaternion r = SN.Quaternion.CreateFromAxisAngle(up, dx * 0.008f) *
+                          SN.Quaternion.CreateFromAxisAngle(right, dy * 0.008f);
+
+        if (dragGizmo)
+        {
+            handRot = SN.Quaternion.Normalize(r * handRot);
+        }
+        else if (dragBone > 0)
+        {
+            bones[dragBone].Rot = SN.Quaternion.Normalize(bones[dragBone].Rot * r);
         }
         Invalidate();
     }
@@ -231,18 +591,17 @@ class PoseForm : Form
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        drag = -1;
+        dragBone = -1;
+        dragGizmo = false;
         Invalidate();
     }
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
-        if (keyData == Keys.R || keyData == (Keys.Shift | Keys.R))
+        if (keyData == Keys.R)
         {
-            lock (bendLock)
-            {
-                for (int i = 0; i < 5; i++) bend[i] = 0f;
-            }
+            handRot = SN.Quaternion.Identity;
+            for (int i = 1; i < 16; i++) bones[i].Rot = SN.Quaternion.Identity;
             Invalidate();
             return true;
         }
@@ -254,131 +613,32 @@ class PoseForm : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
-    // ---------- 绘制 ----------
-
-    protected override void OnPaint(PaintEventArgs e)
-    {
-        Graphics g = e.Graphics;
-        g.SmoothingMode = SmoothingMode.AntiAlias;
-        g.Clear(BG);
-
-        using (SolidBrush palmBrush = new SolidBrush(PALM_FILL))
-        using (Pen palmPen = new Pen(PALM_LINE, 3f))
-        {
-            RectangleF rect = new RectangleF(250f, 425f, 310f, 150f);
-            g.FillRectangle(palmBrush, rect);
-            g.DrawRectangle(palmPen, rect.X, rect.Y, rect.Width, rect.Height);
-        }
-
-        using (SolidBrush dimBrush = new SolidBrush(DIM))
-        using (StringFormat sf = new StringFormat())
-        {
-            sf.Alignment = StringAlignment.Center;
-            g.DrawString("手掌（掌心朝右）", small, dimBrush, new PointF(405f, 555f), sf);
-        }
-
-        using (Pen bonePen = new Pen(BONE, 8f))
-        using (SolidBrush jointBrush = new SolidBrush(JOINT))
-        using (SolidBrush tipBrush = new SolidBrush(TIP))
-        using (SolidBrush tipDragBrush = new SolidBrush(TIP_DRAG))
-        using (Pen tipPen = new Pen(Color.FromArgb(122, 90, 0), 2f))
-        using (SolidBrush textBrush = new SolidBrush(TEXT))
-        {
-            bonePen.StartCap = LineCap.Round;
-            bonePen.EndCap = LineCap.Round;
-
-            for (int i = 0; i < 5; i++)
-            {
-                PointF[] pts = FK(i, bend[i]);
-                for (int k = 0; k < 3; k++)
-                {
-                    g.DrawLine(bonePen, pts[k], pts[k + 1]);
-                }
-                for (int k = 1; k < 3; k++)
-                {
-                    g.FillEllipse(jointBrush, pts[k].X - 8f, pts[k].Y - 8f, 16f, 16f);
-                }
-                bool dragging = (drag == i);
-                float r = dragging ? 14f : 12f;
-                g.FillEllipse(dragging ? tipDragBrush : tipBrush,
-                    pts[3].X - r, pts[3].Y - r, r * 2f, r * 2f);
-                g.DrawEllipse(tipPen, pts[3].X - r, pts[3].Y - r, r * 2f, r * 2f);
-
-                float labelX = (i == 0) ? pts[3].X - 22f : pts[3].X + 22f;
-                using (StringFormat sf = new StringFormat())
-                {
-                    sf.Alignment = (i == 0) ? StringAlignment.Far : StringAlignment.Near;
-                    g.DrawString(
-                        string.Format("{0} {1,3}%", FINGER_NAMES[i], (int)Math.Round(bend[i] * 100f)),
-                        font, textBrush, new PointF(labelX, pts[3].Y - 22f), sf);
-                }
-            }
-        }
-
-        using (SolidBrush textBrush = new SolidBrush(TEXT))
-        {
-            g.DrawString(
-                string.Format(
-                    "UDP {0}:{1}  |  已发 {2} 包  |  {3} Hz  |  拖指尖弯曲，R 复位，Esc 退出",
-                    host, port, sent, (int)rate),
-                font, textBrush, new PointF(20f, 14f));
-        }
-    }
-
     // ---------- 发送 ----------
 
-    float[] Snapshot()
+    static void WriteQuat(List<float> buf, SN.Quaternion q)
     {
-        lock (bendLock)
-        {
-            return (float[])bend.Clone();
-        }
+        q = SN.Quaternion.Normalize(q);
+        buf.Add(q.W);
+        buf.Add(q.X);
+        buf.Add(q.Y);
+        buf.Add(q.Z);
     }
 
-    static float[] BuildQuaternions(float[] b)
+    byte[] BuildPacket(long seq)
     {
-        float[] q = new float[64];   // 16 关节 × 4
-        for (int j = 0; j < 16; j++)
-        {
-            q[j * 4 + 0] = 1f;       // 单位四元数 (w,x,y,z) = (1,0,0,0)
-        }
-        for (int i = 0; i < 5; i++)
-        {
-            float c = b[i];
-            for (int seg = 0; seg < 3; seg++)
-            {
-                float deg = SEG_BEND[seg] * c;
-                double half = deg * Math.PI / 360.0;
-                int joint = BASE_JOINT[i] + seg;
-                q[joint * 4 + 0] = (float)Math.Cos(half);
-                q[joint * 4 + 1] = 0f;
-                q[joint * 4 + 2] = (float)(-Math.Sin(half));
-                q[joint * 4 + 3] = 0f;
-            }
-        }
-        return q;
-    }
+        List<float> qs = new List<float>(64);
+        WriteQuat(qs, handRot);
+        for (int i = 1; i < 16; i++) WriteQuat(qs, bones[i].Rot);
 
-    static byte[] BuildPacket(long seq, float[] q, int hand)
-    {
-        MemoryStream ms = new MemoryStream(272);
-        BinaryWriter bw = new BinaryWriter(ms);
-        bw.Write((byte)'E');
-        bw.Write((byte)'I');
-        bw.Write((byte)'G');
-        bw.Write((byte)'V');
+        System.IO.MemoryStream ms = new System.IO.MemoryStream(272);
+        System.IO.BinaryWriter bw = new System.IO.BinaryWriter(ms);
+        bw.Write((byte)'E'); bw.Write((byte)'I'); bw.Write((byte)'G'); bw.Write((byte)'V');
         bw.Write(VERSION);
         bw.Write((byte)hand);
         bw.Write((byte)0);
         bw.Write((uint)seq);
         bw.Write((uint)(DateTime.UtcNow.Ticks / TimeSpan.TicksPerMillisecond));
-        for (int i = 0; i < 16; i++)
-        {
-            bw.Write(q[i * 4 + 0]);
-            bw.Write(q[i * 4 + 1]);
-            bw.Write(q[i * 4 + 2]);
-            bw.Write(q[i * 4 + 3]);
-        }
+        for (int i = 0; i < 64; i++) bw.Write(qs[i]);
         bw.Flush();
         byte[] data = ms.ToArray();
         bw.Close();
@@ -389,54 +649,32 @@ class PoseForm : Form
     void SendLoop()
     {
         UdpClient udp;
-        try
-        {
-            udp = new UdpClient();
-        }
-        catch
-        {
-            return;
-        }
-
+        try { udp = new UdpClient(); } catch { return; }
         IPEndPoint ep = new IPEndPoint(IPAddress.Parse(host), port);
         long seq = 0;
         double period = 1.0 / SEND_HZ;
         System.Diagnostics.Stopwatch sw = System.Diagnostics.Stopwatch.StartNew();
-
         while (running)
         {
-            float[] b = Snapshot();
-            byte[] packet = BuildPacket(seq, BuildQuaternions(b), hand);
+            byte[] pkt = BuildPacket(seq);
             try
             {
-                udp.Send(packet, packet.Length, ep);
+                udp.Send(pkt, pkt.Length, ep);
                 Interlocked.Increment(ref sent);
             }
-            catch
-            {
-            }
-
+            catch { }
             seq++;
             double target = seq * period;
             double elapsed = sw.Elapsed.TotalSeconds;
-            if (target > elapsed)
-            {
-                Thread.Sleep((int)Math.Max(0, (target - elapsed) * 1000.0));
-            }
+            if (target > elapsed) Thread.Sleep((int)Math.Max(0, (target - elapsed) * 1000.0));
         }
-
-        try { udp.Close(); }
-        catch { }
+        try { udp.Close(); } catch { }
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
         running = false;
-        try
-        {
-            if (sender != null && sender.IsAlive) sender.Join(200);
-        }
-        catch { }
+        try { if (sender != null && sender.IsAlive) sender.Join(200); } catch { }
         timer.Stop();
         base.OnFormClosing(e);
     }
