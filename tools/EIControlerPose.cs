@@ -76,7 +76,8 @@ class PoseForm : Form
 
     SN.Quaternion handRot = SN.Quaternion.Identity;
     int dragBone = -1;
-    bool dragGizmo = false;
+    int ringAxis = -1;
+    float ringLastAngle;
     Point dragLast;
     float yaw = 0f, pitch = 1.45f;
     float distance = 2.0f;
@@ -95,6 +96,10 @@ class PoseForm : Form
     readonly Font small = new Font("Microsoft YaHei UI", 8.5f);
     readonly System.Windows.Forms.Timer timer;
 
+    ComboBox targetCombo;
+    TextBox[] angleBox;
+    Button applyBtn;
+
     public PoseForm(string host, int port, int hand)
     {
         this.host = host;
@@ -111,6 +116,7 @@ class PoseForm : Form
         KeyPreview = true;
 
         InitSkeleton();
+        InitTools();
 
         timer = new System.Windows.Forms.Timer();
         timer.Interval = 33;
@@ -130,6 +136,107 @@ class PoseForm : Form
         sender = new Thread(SendLoop);
         sender.IsBackground = true;
         sender.Start();
+    }
+
+    // ---------- 右侧工具面板 ----------
+
+    void InitTools()
+    {
+        int x0 = 790;
+        Label title = new Label
+        {
+            Text = "关节角度（绝对欧拉角，度）",
+            Left = x0, Top = 80, Width = 200,
+            ForeColor = Color.White, BackColor = Color.Transparent
+        };
+        Controls.Add(title);
+
+        targetCombo = new ComboBox
+        {
+            Left = x0, Top = 108, Width = 200,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        targetCombo.Items.Add("整手（hand）");
+        for (int i = 1; i < 16; i++) targetCombo.Items.Add(names[i]);
+        targetCombo.SelectedIndex = 0;
+        Controls.Add(targetCombo);
+
+        angleBox = new TextBox[3];
+        string[] ax = { "X 角度", "Y 角度", "Z 角度" };
+        for (int i = 0; i < 3; i++)
+        {
+            Label lab = new Label
+            {
+                Text = ax[i], Left = x0, Top = 145 + i * 40, Width = 70,
+                ForeColor = Color.Gainsboro, BackColor = Color.Transparent
+            };
+            Controls.Add(lab);
+            angleBox[i] = new TextBox
+            {
+                Left = x0 + 75, Top = 142 + i * 40, Width = 125,
+                Text = "0"
+            };
+            Controls.Add(angleBox[i]);
+        }
+
+        applyBtn = new Button
+        {
+            Text = "应用角度到选中对象",
+            Left = x0, Top = 280, Width = 200, Height = 30,
+            BackColor = Color.FromArgb(58, 58, 74),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat
+        };
+        applyBtn.Click += delegate { ApplyAngles(); };
+        Controls.Add(applyBtn);
+
+        Button resetBtn = new Button
+        {
+            Text = "全部复位",
+            Left = x0, Top = 320, Width = 200, Height = 30,
+            BackColor = Color.FromArgb(58, 58, 74),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat
+        };
+        resetBtn.Click += delegate { ResetAll(); };
+        Controls.Add(resetBtn);
+
+        Label tip = new Label
+        {
+            Text = "拖圆环：绕世界轴转整手\n拖指节：转该关节\n右键拖：转视角",
+            Left = x0, Top = 365, Width = 200, Height = 80,
+            ForeColor = Color.DimGray, BackColor = Color.Transparent
+        };
+        Controls.Add(tip);
+    }
+
+    static float ParseOrZero(string s)
+    {
+        float v;
+        return float.TryParse(s, out v) ? v : 0f;
+    }
+
+    void ApplyAngles()
+    {
+        float x = ParseOrZero(angleBox[0].Text);
+        float y = ParseOrZero(angleBox[1].Text);
+        float z = ParseOrZero(angleBox[2].Text);
+        const float d2r = (float)Math.PI / 180f;
+        SN.Quaternion q = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitY, y * d2r) *
+                          SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitX, x * d2r) *
+                          SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitZ, z * d2r);
+        int idx = targetCombo.SelectedIndex;
+        if (idx <= 0) handRot = SN.Quaternion.Normalize(q);
+        else bones[idx].Rot = SN.Quaternion.Normalize(q);
+        Invalidate();
+    }
+
+    void ResetAll()
+    {
+        handRot = SN.Quaternion.Identity;
+        for (int i = 1; i < 16; i++) bones[i].Rot = SN.Quaternion.Identity;
+        for (int i = 0; i < 3; i++) angleBox[i].Text = "0";
+        Invalidate();
     }
 
     // ---------- 骨架 ----------
@@ -220,7 +327,8 @@ class PoseForm : Form
         CameraBasis(out eye, out right, out up, out forward);
         SN.Vector3 rel = p - eye;
         float scale = 1300f;
-        float u = SN.Vector3.Dot(rel, right) * scale + ClientSize.Width * 0.5f;
+        float viewW = 780f;
+        float u = SN.Vector3.Dot(rel, right) * scale + viewW * 0.5f;
         float v = -SN.Vector3.Dot(rel, up) * scale + ClientSize.Height * 0.5f;
         depth = SN.Vector3.Dot(rel, forward);
         return new PointF(u, v);
@@ -417,7 +525,7 @@ class PoseForm : Form
             }
         }
 
-        DrawGizmo(g);
+        DrawRings(g);
         DrawHud(g);
         DrawJointInfo(g);
     }
@@ -454,32 +562,76 @@ class PoseForm : Form
 
     // ---------- HUD ----------
 
-    void DrawGizmo(Graphics g)
-    {
-        Rectangle area = new Rectangle(ClientSize.Width - 220, ClientSize.Height - 220, 200, 200);
-        using (SolidBrush back = new SolidBrush(Color.FromArgb(150, 8, 8, 14)))
-            g.FillRectangle(back, area);
+    // ---------- 三轴圆环 ----------
 
-        PointF c = new PointF(area.X + area.Width * 0.5f, area.Y + area.Height * 0.5f);
-        float R = 62f;
-        SN.Quaternion hand = handRot;
-        SN.Vector3[] axes = { SN.Vector3.UnitX, SN.Vector3.UnitY, SN.Vector3.UnitZ };
+    const float RING_R = 58f;
+
+    PointF RingCenter()
+    {
+        return new PointF(780f - 95f, ClientSize.Height - 95f);
+    }
+
+    static float RingAngle(int axis, float t)
+    {
+        return t;
+    }
+
+    // 每个环用椭圆近似：x 环（绕 X 轴）水平压扁，y 环（绕 Y）垂直压扁，z 环是正圆
+    void RingRadii(int axis, float r, out float rx, out float ry)
+    {
+        if (axis == 0) { rx = r * 0.36f; ry = r; }
+        else if (axis == 1) { rx = r; ry = r * 0.36f; }
+        else { rx = r; ry = r; }
+    }
+
+    void DrawRings(Graphics g)
+    {
+        PointF c = RingCenter();
         Color[] cols = { Color.FromArgb(240, 80, 80), Color.FromArgb(80, 235, 100), Color.FromArgb(90, 150, 255) };
-        string[] labels = { "x+肘", "y+右", "z+天" };
-        for (int i = 0; i < 3; i++)
+        for (int a = 0; a < 3; a++)
         {
-            SN.Vector3 dir = SN.Vector3.Transform(axes[i], hand);
-            float u = SN.Vector3.Dot(dir, new SN.Vector3(1, 0, 0)) * R;
-            float v = -SN.Vector3.Dot(dir, new SN.Vector3(0, 0, 1)) * R;
-            using (Pen pen = new Pen(cols[i], 3f))
-                g.DrawLine(pen, c, new PointF(c.X + u, c.Y + v));
-            using (SolidBrush br = new SolidBrush(cols[i]))
-                g.FillEllipse(br, c.X + u - 5, c.Y + v - 5, 10, 10);
-            using (SolidBrush br = new SolidBrush(Color.FromArgb(200, 220, 220, 235)))
-                g.DrawString(labels[i], small, br, c.X + u + 7, c.Y + v - 8);
+            float rx, ry;
+            RingRadii(a, RING_R, out rx, out ry);
+            using (Pen pen = new Pen(cols[a], 2.4f))
+            {
+                g.DrawEllipse(pen, c.X - rx, c.Y - ry, rx * 2, ry * 2);
+            }
         }
-        using (Pen pen = new Pen(Color.FromArgb(150, 190, 190, 210), 1.2f))
-            g.DrawEllipse(pen, c.X - R, c.Y - R, R * 2, R * 2);
+        using (SolidBrush br = new SolidBrush(Color.FromArgb(230, 255, 255, 255)))
+        {
+            g.FillEllipse(br, c.X - 3, c.Y - 3, 6, 6);
+        }
+        using (SolidBrush br = new SolidBrush(Color.FromArgb(160, 200, 200, 215)))
+        {
+            g.DrawString("x 环 / y 环 / z 环", small, br, c.X - 52, c.Y + RING_R + 6);
+        }
+    }
+
+    int HitRing(Point p)
+    {
+        PointF c = RingCenter();
+        int best = -1;
+        float bestD = 12f;
+        for (int a = 0; a < 3; a++)
+        {
+            float rx, ry;
+            RingRadii(a, RING_R, out rx, out ry);
+            for (int i = 0; i < 72; i++)
+            {
+                float t = i * (float)Math.PI * 2 / 72;
+                float x = c.X + rx * (float)Math.Cos(t);
+                float y = c.Y + ry * (float)Math.Sin(t);
+                float dx = x - p.X;
+                float dy = y - p.Y;
+                float d = (float)Math.Sqrt(dx * dx + dy * dy);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    best = a;
+                }
+            }
+        }
+        return best;
     }
 
     void DrawHud(Graphics g)
@@ -490,7 +642,7 @@ class PoseForm : Form
                 string.Format("UDP {0}:{1}   {2} Hz   已发 {3} 包", host, port, (int)rate, sent),
                 font, br, new PointF(16, 12));
             g.DrawString(
-                "拖指节=转该关节   拖右下角三轴球=转整手   右键拖=转视角   R=复位   Esc=退出",
+                "拖指节=转该关节   拖右下角圆环=绕世界轴转整手   右键拖=转视角   R=复位   Esc=退出",
                 small, br, new PointF(16, 40));
             g.DrawString("坐标：x+ 肘部 / y+ 身体右 / z+ 天空（与固件机体系一致）", small, br, new PointF(16, 60));
         }
@@ -528,9 +680,12 @@ class PoseForm : Form
             return;
         }
 
-        if (new Rectangle(ClientSize.Width - 220, ClientSize.Height - 220, 200, 200).Contains(e.Location))
+        int hit = HitRing(e.Location);
+        if (hit >= 0)
         {
-            dragGizmo = true;
+            ringAxis = hit;
+            PointF rc = RingCenter();
+            ringLastAngle = (float)Math.Atan2(e.Y - rc.Y, e.X - rc.X);
             return;
         }
 
@@ -572,16 +727,24 @@ class PoseForm : Form
 
         if (e.Button != MouseButtons.Left) return;
 
+        if (ringAxis >= 0)
+        {
+            PointF rc = RingCenter();
+            float now = (float)Math.Atan2(e.Y - rc.Y, e.X - rc.X);
+            float delta = now - ringLastAngle;
+            ringLastAngle = now;
+            SN.Vector3 axis = ringAxis == 0 ? SN.Vector3.UnitX : (ringAxis == 1 ? SN.Vector3.UnitY : SN.Vector3.UnitZ);
+            handRot = SN.Quaternion.Normalize(SN.Quaternion.CreateFromAxisAngle(axis, delta) * handRot);
+            Invalidate();
+            return;
+        }
+
         SN.Vector3 eye, right, up, forward;
         CameraBasis(out eye, out right, out up, out forward);
         SN.Quaternion r = SN.Quaternion.CreateFromAxisAngle(up, dx * 0.008f) *
                           SN.Quaternion.CreateFromAxisAngle(right, dy * 0.008f);
 
-        if (dragGizmo)
-        {
-            handRot = SN.Quaternion.Normalize(r * handRot);
-        }
-        else if (dragBone > 0)
+        if (dragBone > 0)
         {
             bones[dragBone].Rot = SN.Quaternion.Normalize(bones[dragBone].Rot * r);
         }
@@ -592,7 +755,7 @@ class PoseForm : Form
     {
         base.OnMouseUp(e);
         dragBone = -1;
-        dragGizmo = false;
+        ringAxis = -1;
         Invalidate();
     }
 
@@ -600,9 +763,7 @@ class PoseForm : Form
     {
         if (keyData == Keys.R)
         {
-            handRot = SN.Quaternion.Identity;
-            for (int i = 1; i < 16; i++) bones[i].Rot = SN.Quaternion.Identity;
-            Invalidate();
+            ResetAll();
             return true;
         }
         if (keyData == Keys.Escape)
