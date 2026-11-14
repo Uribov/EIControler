@@ -88,7 +88,7 @@ namespace EIGlove
         HandControl _handControl;
         float _springWasPercent;
         bool _springWasOn;
-        // 食指三节上一帧的 bend，用于单帧限幅
+        // 五指三节上一帧的 bend，用于单帧限幅
         readonly float[] _lastBend = new float[3];
 
         long _rxCount;
@@ -693,7 +693,7 @@ namespace EIGlove
                 }
             }
 
-            // 数据驱动：右手食指三节走官方 HandOutput 通道
+            // 数据驱动：右手食指三节走官方 HandOutput 通道（其余手指待标定后再接）
             if (HANDOUT_TEST && _handOutReady && _handOut != null && _applied != null)
             {
                 WriteFingerBend(_applied[4], _handOut.indexProximalBendJSON, 0);

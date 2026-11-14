@@ -14,6 +14,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading;
 using System.Windows.Forms;
 using SN = System.Numerics;
@@ -107,7 +108,7 @@ class PoseForm : Form
         this.hand = hand;
 
         Text = "EIGlove 手部姿态编辑器（3D） · x+肘 / y+右 / z+天（同固件机体系）";
-        ClientSize = new Size(1000, 760);
+        ClientSize = new Size(1000, 920);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -201,10 +202,21 @@ class PoseForm : Form
         resetBtn.Click += delegate { ResetAll(); };
         Controls.Add(resetBtn);
 
+        Button exportBtn = new Button
+        {
+            Text = "导出状态 CSV",
+            Left = x0, Top = 360, Width = 200, Height = 30,
+            BackColor = Color.FromArgb(58, 58, 74),
+            ForeColor = Color.White,
+            FlatStyle = FlatStyle.Flat
+        };
+        exportBtn.Click += delegate { ExportCsv(); };
+        Controls.Add(exportBtn);
+
         Label tip = new Label
         {
             Text = "拖圆环：绕世界轴转整手\n拖指节：转该关节\n右键拖：转视角",
-            Left = x0, Top = 365, Width = 200, Height = 80,
+            Left = x0, Top = 405, Width = 200, Height = 80,
             ForeColor = Color.DimGray, BackColor = Color.Transparent
         };
         Controls.Add(tip);
@@ -237,6 +249,40 @@ class PoseForm : Form
         for (int i = 1; i < 16; i++) bones[i].Rot = SN.Quaternion.Identity;
         for (int i = 0; i < 3; i++) angleBox[i].Text = "0";
         Invalidate();
+    }
+
+    static SN.Vector3 QuatToEuler(SN.Quaternion q)
+    {
+        float sinr = 2f * (q.W * q.X + q.Y * q.Z);
+        float cosr = 1f - 2f * (q.X * q.X + q.Y * q.Y);
+        float rx = (float)Math.Atan2(sinr, cosr);
+        float sinp = 2f * (q.W * q.Y - q.Z * q.X);
+        if (sinp > 1f) sinp = 1f;
+        if (sinp < -1f) sinp = -1f;
+        float ry = (float)Math.Asin(sinp);
+        float siny = 2f * (q.W * q.Z + q.X * q.Y);
+        float cosy = 1f - 2f * (q.Y * q.Y + q.Z * q.Z);
+        float rz = (float)Math.Atan2(siny, cosy);
+        const float r2d = 180f / (float)Math.PI;
+        return new SN.Vector3(rx * r2d, ry * r2d, rz * r2d);
+    }
+
+    void ExportCsv()
+    {
+        SN.Quaternion hand = handRot;
+        StringBuilder sb = new StringBuilder();
+        sb.AppendLine("joint,px,py,pz,rx,ry,rz");
+        for (int i = 0; i < 16; i++)
+        {
+            SN.Vector3 p = WorldPos(i, hand);
+            SN.Vector3 e = QuatToEuler(WorldRot(i, hand));
+            sb.AppendLine(string.Format("{0},{1:F4},{2:F4},{3:F4},{4:F1},{5:F1},{6:F1}",
+                names[i], p.X, p.Y, p.Z, e.X, e.Y, e.Z));
+        }
+        string dir = System.IO.Path.GetDirectoryName(Application.ExecutablePath);
+        string path = System.IO.Path.Combine(dir, "pose_state.csv");
+        System.IO.File.WriteAllText(path, sb.ToString());
+        MessageBox.Show("已导出：" + path);
     }
 
     // ---------- 骨架 ----------
@@ -328,8 +374,9 @@ class PoseForm : Form
         SN.Vector3 rel = p - eye;
         float scale = 1300f;
         float viewW = 780f;
+        float viewH = 760f;
         float u = SN.Vector3.Dot(rel, right) * scale + viewW * 0.5f;
-        float v = -SN.Vector3.Dot(rel, up) * scale + ClientSize.Height * 0.5f;
+        float v = -SN.Vector3.Dot(rel, up) * scale + viewH * 0.5f;
         depth = SN.Vector3.Dot(rel, forward);
         return new PointF(u, v);
     }
@@ -528,6 +575,7 @@ class PoseForm : Form
         DrawRings(g);
         DrawHud(g);
         DrawJointInfo(g);
+        DrawStateTable(g);
     }
 
     // ---------- 世界坐标轴（固定原点，标定基准） ----------
@@ -568,7 +616,7 @@ class PoseForm : Form
 
     PointF RingCenter()
     {
-        return new PointF(780f - 95f, ClientSize.Height - 95f);
+        return new PointF(780f - 95f, 760f - 95f);
     }
 
     static float RingAngle(int axis, float t)
@@ -664,6 +712,48 @@ class PoseForm : Form
                     g.DrawString(names[i], small, cb, new PointF(16, y));
                 g.DrawString(string.Format("{0,6:F1}°", ang), small, br, new PointF(110, y));
                 y += 16;
+            }
+        }
+    }
+
+    // ---------- 状态表（每个关节的世界位置/欧拉角） ----------
+
+    void DrawStateTable(Graphics g)
+    {
+        float y0 = 760f;
+        using (Pen pen = new Pen(Color.FromArgb(70, 70, 85), 1f))
+        {
+            g.DrawLine(pen, 0, y0, ClientSize.Width, y0);
+        }
+
+        SN.Quaternion hand = handRot;
+        using (SolidBrush head = new SolidBrush(Color.FromArgb(160, 160, 180)))
+        {
+            g.DrawString("关节", small, head, new PointF(8, y0 + 3));
+            g.DrawString("位置（x,y,z）", small, head, new PointF(86, y0 + 3));
+            g.DrawString("欧拉角（x,y,z °）", small, head, new PointF(248, y0 + 3));
+            g.DrawString("关节", small, head, new PointF(510, y0 + 3));
+            g.DrawString("位置（x,y,z）", small, head, new PointF(588, y0 + 3));
+            g.DrawString("欧拉角（x,y,z °）", small, head, new PointF(750, y0 + 3));
+        }
+
+        for (int i = 0; i < 16; i++)
+        {
+            int col = i / 8;
+            int row = i % 8;
+            float x = (col == 0) ? 8f : 510f;
+            float y = y0 + 20f + row * 16f;
+            SN.Vector3 p = WorldPos(i, hand);
+            SN.Vector3 e = QuatToEuler(WorldRot(i, hand));
+            Color c = FingerColor(i);
+            using (SolidBrush nb = new SolidBrush(c))
+            {
+                g.DrawString(names[i], small, nb, new PointF(x, y));
+            }
+            using (SolidBrush vb = new SolidBrush(Color.FromArgb(200, 200, 200, 215)))
+            {
+                g.DrawString(string.Format("{0,6:F3} {1,6:F3} {2,6:F3}", p.X, p.Y, p.Z), small, vb, new PointF(x + 78, y));
+                g.DrawString(string.Format("{0,5:F0} {1,5:F0} {2,5:F0}", e.X, e.Y, e.Z), small, vb, new PointF(x + 240, y));
             }
         }
     }
