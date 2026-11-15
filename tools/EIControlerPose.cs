@@ -298,8 +298,8 @@ class PoseForm : Form
             BoxHalf = new SN.Vector3(0.0375f, 0.050f, 0.012f)
         };
 
-        // 拇指：从手掌左侧(-y)边缘斜着伸出
-        AddChain(1, 0, new SN.Vector3(-0.012f, -0.045f, 0f), SN.Vector3.Normalize(new SN.Vector3(-0.55f, -0.83f, 0f)),
+        // 拇指：从手掌左侧(-y)边缘斜着伸出，相对 -x 外张约 30°
+        AddChain(1, 0, new SN.Vector3(-0.012f, -0.045f, 0f), SN.Vector3.Normalize(new SN.Vector3(-0.866f, -0.5f, 0f)),
                  new float[] { 0.034f, 0.03f, 0.024f }, new float[] { 0.022f, 0.019f, 0.016f });
         // 四指：间距 0.023，指根 z 有 22° 横弓（中指最高、小指最低，弧深约 4mm）
         // 张角按放松态：食指 -5°、中指 0°、无名指 +5°、小指 +12°
