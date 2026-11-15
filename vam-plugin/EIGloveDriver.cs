@@ -137,8 +137,8 @@ namespace EIGlove
                 RegisterFloat(_smoothJSON);
                 CreateSlider(_smoothJSON);
 
-                // 手指轴向映射模式（0~5），运行时拖动切换，不用重载；实测 3 = (x, z, -y) 正确
-                _fingerMapModeJSON = new JSONStorableFloat("fingerMap", 3f, 0f, 5f, true);
+                // 手指轴向映射模式（0~9），运行时拖动切换，不用重载；实测 2 = (x, -z, y) 向掌心弯
+                _fingerMapModeJSON = new JSONStorableFloat("fingerMap", 2f, 0f, 9f, true);
                 RegisterFloat(_fingerMapModeJSON);
                 CreateSlider(_fingerMapModeJSON);
 
@@ -242,7 +242,7 @@ namespace EIGlove
                 {
                     _bones[i] = t;
                     _restRotation[i] = t.localRotation;
-                    _applied[i] = t.localRotation;
+                    _applied[i] = Quaternion.identity;
                     found++;
                 }
             }
@@ -685,11 +685,12 @@ namespace EIGlove
                 {
                     int o = i * 4;
                     var q = new Quaternion(_latest[o + 1], _latest[o + 2], _latest[o + 3], _latest[o]);
-                    goal = mount * q;
+                    // _applied 是相对 rest 的增量（数据），不再叠 mount
+                    goal = q;
                 }
                 else
                 {
-                    goal = _restRotation[i];
+                    goal = Quaternion.identity;
                 }
 
                 // 目标先按强度插值，再按平滑系数逼近，避免抖动
@@ -698,7 +699,7 @@ namespace EIGlove
                 // HANDOUT_TEST 下手指出 HandOutput 驱动，但 hand 骨骼仍要写，手背才能跟着转
                 if (_writing && (!HANDOUT_TEST || i == 0))
                 {
-                    bone.localRotation = BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 1);
+                    bone.localRotation = _restRotation[i] * BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 3);
                 }
             }
 
@@ -835,7 +836,8 @@ namespace EIGlove
         {
             if (i == 0)
             {
-                return new Quaternion(q.x, q.z, q.y, q.w);
+                // hand：(x, z, y) 基础上把左右摆翻正（工具 z → VaM -y），其余轴不动
+                return new Quaternion(q.x, -q.z, q.y, q.w);
             }
             switch (mode)
             {
@@ -845,6 +847,10 @@ namespace EIGlove
                 case 3: return new Quaternion(q.x, q.z, -q.y, q.w);
                 case 4: return new Quaternion(-q.x, -q.z, q.y, q.w);
                 case 5: return new Quaternion(q.z, q.x, q.y, q.w);
+                case 6: return new Quaternion(q.y, q.z, q.x, q.w);
+                case 7: return new Quaternion(q.y, -q.z, q.x, q.w);
+                case 8: return new Quaternion(-q.y, q.z, q.x, q.w);
+                case 9: return new Quaternion(q.y, q.x, q.z, q.w);
                 default: return q;
             }
         }
@@ -864,7 +870,7 @@ namespace EIGlove
                 }
                 if (_bones[i] != null)
                 {
-                    _bones[i].localRotation = BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 1);
+                    _bones[i].localRotation = _restRotation[i] * BoneToUnity(i, _applied[i], (_fingerMapModeJSON != null) ? (int)_fingerMapModeJSON.val : 3);
                 }
             }
         }

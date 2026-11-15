@@ -301,14 +301,15 @@ class PoseForm : Form
         // 拇指：从手掌左侧(-y)边缘斜着伸出
         AddChain(1, 0, new SN.Vector3(-0.012f, -0.045f, 0f), SN.Vector3.Normalize(new SN.Vector3(-0.55f, -0.83f, 0f)),
                  new float[] { 0.034f, 0.03f, 0.024f }, new float[] { 0.022f, 0.019f, 0.016f });
-        // 四指等距分布：间距 0.024，根都在手掌 -x 端面内，中指严格沿 -x，张开角略收
-        AddChain(4, 0, new SN.Vector3(-0.075f, -0.039f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, -0.12f, 0f)),
+        // 四指：间距 0.023，指根 z 有 22° 横弓（中指最高、小指最低，弧深约 4mm）
+        // 张角按放松态：食指 -5°、中指 0°、无名指 +5°、小指 +12°
+        AddChain(4, 0, new SN.Vector3(-0.075f, -0.0345f, -0.0020f), SN.Vector3.Normalize(new SN.Vector3(-1f, -0.087f, 0f)),
                  new float[] { 0.042f, 0.032f, 0.026f }, new float[] { 0.021f, 0.018f, 0.015f });
-        AddChain(7, 0, new SN.Vector3(-0.075f, -0.015f, 0f), -ELBOW,
+        AddChain(7, 0, new SN.Vector3(-0.075f, -0.0115f, 0f), -ELBOW,
                  new float[] { 0.045f, 0.034f, 0.027f }, new float[] { 0.022f, 0.019f, 0.015f });
-        AddChain(10, 0, new SN.Vector3(-0.075f, 0.009f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.12f, 0f)),
+        AddChain(10, 0, new SN.Vector3(-0.075f, 0.0115f, -0.0015f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.087f, 0f)),
                  new float[] { 0.042f, 0.032f, 0.026f }, new float[] { 0.021f, 0.018f, 0.015f });
-        AddChain(13, 0, new SN.Vector3(-0.073f, 0.033f, 0f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.25f, 0f)),
+        AddChain(13, 0, new SN.Vector3(-0.073f, 0.0345f, -0.0040f), SN.Vector3.Normalize(new SN.Vector3(-1f, 0.21f, 0f)),
                  new float[] { 0.034f, 0.026f, 0.021f }, new float[] { 0.019f, 0.016f, 0.013f });
     }
 
