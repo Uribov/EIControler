@@ -162,6 +162,37 @@ class PoseForm : Form
         targetCombo.SelectedIndex = 0;
         Controls.Add(targetCombo);
 
+        Label poseLab = new Label
+        {
+            Text = "动作预设",
+            Left = x0, Top = 470, Width = 200, Height = 18,
+            ForeColor = Color.Gainsboro, BackColor = Color.Transparent
+        };
+        Controls.Add(poseLab);
+
+        ComboBox poseCombo = new ComboBox
+        {
+            Left = x0, Top = 490, Width = 200, Height = 24,
+            DropDownStyle = ComboBoxStyle.DropDownList
+        };
+        poseCombo.Items.Add("自定义");
+        poseCombo.Items.Add("张开（标定）");
+        poseCombo.Items.Add("握拳");
+        poseCombo.Items.Add("点赞");
+        poseCombo.Items.Add("挥手");
+        poseCombo.Items.Add("OK");
+        poseCombo.Items.Add("比耶");
+        poseCombo.Items.Add("竖中指");
+        poseCombo.SelectedIndex = 0;
+        poseCombo.SelectedIndexChanged += delegate
+        {
+            if (poseCombo.SelectedIndex > 0)
+            {
+                ApplyPreset(poseCombo.SelectedIndex - 1);
+            }
+        };
+        Controls.Add(poseCombo);
+
         angleBox = new TextBox[3];
         string[] ax = { "X 角度", "Y 角度", "Z 角度" };
         for (int i = 0; i < 3; i++)
@@ -240,6 +271,69 @@ class PoseForm : Form
         int idx = targetCombo.SelectedIndex;
         if (idx <= 0) handRot = SN.Quaternion.Normalize(q);
         else bones[idx].Rot = SN.Quaternion.Normalize(q);
+        Invalidate();
+    }
+
+    static SN.Quaternion EulerTool(float x, float y, float z)
+    {
+        const float d2r = (float)Math.PI / 180f;
+        SN.Quaternion qy = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitY, y * d2r);
+        SN.Quaternion qx = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitX, x * d2r);
+        SN.Quaternion qz = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitZ, z * d2r);
+        return SN.Quaternion.Multiply(SN.Quaternion.Multiply(qy, qx), qz);
+    }
+
+    // 动作预设：每行 16 个关节 × (x, y, z) 欧拉角（tool 顺序 Y-X-Z）
+    // y 正 = 向伸直/手背，y 负 = 向掌心弯曲
+    static readonly float[][,] PRESETS = new float[][,]
+    {
+        // 0 张开（标定姿势）
+        new float[,] {
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0} },
+        // 1 握拳
+        new float[,] {
+            {0,0,0},{0,-40,0},{0,-30,0},{0,-20,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},
+            {0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
+        // 2 点赞（拇指伸，四指握拳）
+        new float[,] {
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},
+            {0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
+        // 3 挥手（手指伸直，hand 绕 z 摆）
+        new float[,] {
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0} },
+        // 4 OK（拇指+食指成环）
+        new float[,] {
+            {0,0,0},{0,-40,0},{0,-40,0},{0,0,0},{0,-50,0},{0,-50,0},{0,0,0},{0,0,0},
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0} },
+        // 5 比耶（食指+中指伸）
+        new float[,] {
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
+            {0,0,0},{0,0,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
+        // 6 竖中指
+        new float[,] {
+            {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,0,0},
+            {0,0,0},{0,0,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
+    };
+
+    void ApplyPreset(int idx)
+    {
+        if (idx < 0 || idx >= PRESETS.Length)
+        {
+            return;
+        }
+        float[,] d = PRESETS[idx];
+        handRot = SN.Quaternion.Identity;
+        for (int i = 1; i < 16; i++)
+        {
+            bones[i].Rot = EulerTool(d[i, 0], d[i, 1], d[i, 2]);
+        }
+        // 挥手：手腕左右摆 45°
+        if (idx == 3)
+        {
+            handRot = EulerTool(0, 0, 45);
+        }
         Invalidate();
     }
 
