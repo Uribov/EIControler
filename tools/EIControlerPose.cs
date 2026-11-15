@@ -501,6 +501,24 @@ class PoseForm : Form
         return fingerColors[Math.Min(f, fingerColors.Length - 1)];
     }
 
+    static SN.Quaternion LookRot(SN.Vector3 dir, SN.Vector3 upHint)
+    {
+        SN.Vector3 z = SN.Vector3.Normalize(dir);
+        SN.Vector3 x = SN.Vector3.Cross(upHint, z);
+        if (x.Length() < 0.01f)
+        {
+            x = SN.Vector3.Cross(SN.Vector3.UnitX, z);
+        }
+        x = SN.Vector3.Normalize(x);
+        SN.Vector3 y = SN.Vector3.Cross(z, x);
+        SN.Matrix4x4 m = new SN.Matrix4x4(
+            x.X, x.Y, x.Z, 0f,
+            y.X, y.Y, y.Z, 0f,
+            z.X, z.Y, z.Z, 0f,
+            0f, 0f, 0f, 1f);
+        return SN.Quaternion.CreateFromRotationMatrix(m);
+    }
+
     void AddCylinder(List<Face> faces, SN.Vector3 a, SN.Vector3 b, float r, int idx, SN.Vector3 light, bool selected)
     {
         SN.Vector3 dir = SN.Vector3.Normalize(b - a);
@@ -642,7 +660,11 @@ class PoseForm : Form
             }
             else
             {
-                AddCylinder(faces, start, end, b.Width * 0.5f, i, light, dragBone == i);
+                // 指节用长方体：有清晰的面和棱，能看出绕指骨轴的扭转
+                SN.Vector3 segDir = end - start;
+                AddBox(faces, (start + end) * 0.5f,
+                       new SN.Vector3(b.Width * 0.5f, b.Width * 0.35f, segDir.Length() * 0.5f),
+                       LookRot(segDir, SN.Vector3.UnitZ), i, light, dragBone == i);
             }
             AddSphere(faces, start, b.Width * 0.46f, FingerColor(i), 0f);
             if (i == 3 || i == 6 || i == 9 || i == 12 || i == 15)
