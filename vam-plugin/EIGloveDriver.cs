@@ -73,6 +73,13 @@ namespace EIGlove
         readonly Collider[] _gripHits = new Collider[16];
         bool _gripCollision;
         Rigidbody _gripTarget;
+        // 抓取应用到 VaM 的右手控制器
+        FreeControllerV3 _gripFc;
+        bool _gripApplied;
+        JSONStorableBool _gripEnableJSON;
+        JSONStorableFloat _gripBendJSON;
+        JSONStorableFloat _gripSpreadJSON;
+        JSONStorableFloat _gripRadiusJSON;
 
         // VaM 1.22 的人物骨骼是 DAZBone（挂在骨骼 Transform 上），皮肤由
         // DAZSkinV2 做 GPU 蒙皮。名字匹配到同名 Transform 不一定是皮肤骨骼，
@@ -149,6 +156,23 @@ namespace EIGlove
                 _fingerMapModeJSON = new JSONStorableFloat("fingerMap", 2f, 0f, 9f, true);
                 RegisterFloat(_fingerMapModeJSON);
                 CreateSlider(_fingerMapModeJSON);
+
+                // 抓握判定参数（硬件到位后调）
+                _gripEnableJSON = new JSONStorableBool("gripEnable", true);
+                RegisterBool(_gripEnableJSON);
+                CreateToggle(_gripEnableJSON);
+
+                _gripBendJSON = new JSONStorableFloat("gripBend", 40f, 10f, 80f, false);
+                RegisterFloat(_gripBendJSON);
+                CreateSlider(_gripBendJSON);
+
+                _gripSpreadJSON = new JSONStorableFloat("gripSpread", 12f, 0f, 40f, false);
+                RegisterFloat(_gripSpreadJSON);
+                CreateSlider(_gripSpreadJSON);
+
+                _gripRadiusJSON = new JSONStorableFloat("gripRadius", 0.06f, 0.02f, 0.15f, false);
+                RegisterFloat(_gripRadiusJSON);
+                CreateSlider(_gripRadiusJSON);
 
                 _lastReport = Time.realtimeSinceStartup;
 
@@ -391,6 +415,9 @@ namespace EIGlove
                         _handOut.outputConnectedJSON.SetVal(true);
                     }
                     _handOutReady = true;
+                    // 抓取用的控制器（同一 GameObject 上的 FreeControllerV3）
+                    _gripFc = _handOut.GetComponent<FreeControllerV3>();
+                    SuperController.LogMessage($"[EIGlove] 抓取控制器：{(_gripFc != null ? "已找到" : "未找到")}");
                     string range = "n/a";
                     if (_handOut.indexProximalBendJSON != null)
                     {
@@ -770,6 +797,7 @@ namespace EIGlove
 
             // 爪形 + 体积碰撞检测（每帧算，供抓取判定用）
             ComputeGrip();
+            ApplyGrip();
 
             Report();
         }
@@ -996,14 +1024,17 @@ namespace EIGlove
             }
             _gripBend = bendN > 0 ? bendSum / bendN : 0f;
             _gripSpread = spreadN > 0 ? spreadSum / spreadN : 0f;
-            bool shapeOk = _gripBend > GRIP_BEND_THRESHOLD && _gripSpread > GRIP_SPREAD_THRESHOLD;
+            float bendTh = _gripBendJSON != null ? _gripBendJSON.val : GRIP_BEND_THRESHOLD;
+            float spreadTh = _gripSpreadJSON != null ? _gripSpreadJSON.val : GRIP_SPREAD_THRESHOLD;
+            float radius = _gripRadiusJSON != null ? _gripRadiusJSON.val : GRIP_RADIUS;
+            bool shapeOk = _gripBend > bendTh && _gripSpread > spreadTh;
 
             // 体积碰撞：爪形 + 手部碰撞球碰到可抓物体（排除人物自身）
             _gripCollision = false;
             _gripTarget = null;
             if (shapeOk && _bones[0] != null)
             {
-                int hits = Physics.OverlapSphereNonAlloc(_bones[0].position, GRIP_RADIUS, _gripHits);
+                int hits = Physics.OverlapSphereNonAlloc(_bones[0].position, radius, _gripHits);
                 for (int k = 0; k < hits; k++)
                 {
                     Rigidbody rb = _gripHits[k].attachedRigidbody;
@@ -1021,6 +1052,31 @@ namespace EIGlove
                 }
             }
             _gripActive = shapeOk && _gripCollision;
+        }
+
+        // 把爪形+碰撞结果应用到 VaM 右手控制器（只在状态变化时写）
+        void ApplyGrip()
+        {
+            if (_gripFc == null)
+            {
+                return;
+            }
+            bool enabled = _gripEnableJSON == null || _gripEnableJSON.val;
+            bool active = enabled && _gripActive;
+            if (active == _gripApplied)
+            {
+                return;
+            }
+            _gripApplied = active;
+            try
+            {
+                _gripFc.isGrabbing = active;
+                SuperController.LogMessage($"[EIGlove] 抓取 {(active ? "开始" : "结束")}（bend={_gripBend:F1} spread={_gripSpread:F1} target={(_gripTarget != null ? _gripTarget.name : "none")}）");
+            }
+            catch (Exception e)
+            {
+                SuperController.LogError("[EIGlove] 设置 isGrabbing 失败: " + e.Message);
+            }
         }
 
         void Report()
