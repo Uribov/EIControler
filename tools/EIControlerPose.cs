@@ -291,9 +291,9 @@ class PoseForm : Form
         new float[,] {
             {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
             {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0} },
-        // 1 握拳
+        // 1 握拳（拇指角度取自 pose_state.csv 实测：thumb1/2/3 local 欧拉角）
         new float[,] {
-            {0,0,0},{0,-40,0},{0,-30,0},{0,-20,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},
+            {0,0,0},{56.5f,-40.4f,-6.5f},{24f,-26.6f,-52.2f},{23.5f,2.6f,-43.6f},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},
             {0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
         // 2 点赞（拇指伸，四指握拳）
         new float[,] {
@@ -317,6 +317,16 @@ class PoseForm : Form
             {0,0,0},{0,0,0},{0,-80,0},{0,-90,0},{0,-60,0},{0,-80,0},{0,-90,0},{0,-60,0} },
     };
 
+    static SN.Quaternion EulerToolZYX(float x, float y, float z)
+    {
+        const float d2r = (float)Math.PI / 180f;
+        SN.Quaternion rx = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitX, x * d2r);
+        SN.Quaternion ry = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitY, y * d2r);
+        SN.Quaternion rz = SN.Quaternion.CreateFromAxisAngle(SN.Vector3.UnitZ, z * d2r);
+        // R = Rz * Ry * Rx（与 QuatToEuler 的分解顺序一致）
+        return SN.Quaternion.Multiply(SN.Quaternion.Multiply(rz, ry), rx);
+    }
+
     void ApplyPreset(int idx)
     {
         if (idx < 0 || idx >= PRESETS.Length)
@@ -327,7 +337,7 @@ class PoseForm : Form
         handRot = SN.Quaternion.Identity;
         for (int i = 1; i < 16; i++)
         {
-            bones[i].Rot = EulerTool(d[i, 0], d[i, 1], d[i, 2]);
+            bones[i].Rot = EulerToolZYX(d[i, 0], d[i, 1], d[i, 2]);
         }
         // 挥手：手腕左右摆 45°
         if (idx == 3)
