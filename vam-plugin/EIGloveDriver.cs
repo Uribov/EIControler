@@ -65,6 +65,14 @@ namespace EIGlove
         float[] _latest;
         float _lastPacketTime = -999f;
         float _currentStrength;
+        // 爪形抓握检测（参考抓握矿泉水瓶的实测关节角）
+        float _gripBend;
+        float _gripSpread;
+        bool _gripActive;
+        // 体积碰撞：手部碰撞球与可抓物体的接触
+        readonly Collider[] _gripHits = new Collider[16];
+        bool _gripCollision;
+        Rigidbody _gripTarget;
 
         // VaM 1.22 的人物骨骼是 DAZBone（挂在骨骼 Transform 上），皮肤由
         // DAZSkinV2 做 GPU 蒙皮。名字匹配到同名 Transform 不一定是皮肤骨骼，
@@ -752,6 +760,17 @@ namespace EIGlove
                 SuperController.LogMessage(msg);
             }
 
+            if (DIAG && (Time.frameCount % 15 == 0))
+            {
+                SuperController.LogMessage(string.Format(
+                    "[EIGlove:DIAG] grip bend={0:F1} spread={1:F1} on={2} col={3} target={4}",
+                    _gripBend, _gripSpread, _gripActive, _gripCollision,
+                    _gripTarget != null ? _gripTarget.name : "none"));
+            }
+
+            // 爪形 + 体积碰撞检测（每帧算，供抓取判定用）
+            ComputeGrip();
+
             Report();
         }
 
@@ -935,6 +954,73 @@ namespace EIGlove
                 bend = json.max;
             }
             json.val = bend;
+        }
+
+        // 抓握矿泉水瓶的实测关节角（MCP ~40-50°、PIP ~60-70°），阈值取 40°
+        const float GRIP_BEND_THRESHOLD = 40f;
+        const float GRIP_SPREAD_THRESHOLD = 12f;
+        // 手部碰撞球半径（抓握接触判定）
+        const float GRIP_RADIUS = 0.06f;
+
+        // 爪形判定：四指弯曲度 + 张开度（从手套原始四元数算）
+        void ComputeGrip()
+        {
+            _gripBend = 0f;
+            _gripSpread = 0f;
+            _gripActive = false;
+            if (_latest == null)
+            {
+                return;
+            }
+            float bendSum = 0f;
+            int bendN = 0;
+            float spreadSum = 0f;
+            int spreadN = 0;
+            for (int i = 4; i <= 15; i++)
+            {
+                int o = i * 4;
+                if (o + 3 >= _latest.Length)
+                {
+                    continue;
+                }
+                Quaternion q = new Quaternion(_latest[o + 1], _latest[o + 2], _latest[o + 3], _latest[o]);
+                float by = 2f * Mathf.Asin(Mathf.Min(1f, Mathf.Abs(q.y))) * Mathf.Rad2Deg;
+                bendSum += by;
+                bendN++;
+                if (i == 4 || i == 7 || i == 10 || i == 13)
+                {
+                    float bz = 2f * Mathf.Asin(Mathf.Min(1f, Mathf.Abs(q.z))) * Mathf.Rad2Deg;
+                    spreadSum += bz;
+                    spreadN++;
+                }
+            }
+            _gripBend = bendN > 0 ? bendSum / bendN : 0f;
+            _gripSpread = spreadN > 0 ? spreadSum / spreadN : 0f;
+            bool shapeOk = _gripBend > GRIP_BEND_THRESHOLD && _gripSpread > GRIP_SPREAD_THRESHOLD;
+
+            // 体积碰撞：爪形 + 手部碰撞球碰到可抓物体（排除人物自身）
+            _gripCollision = false;
+            _gripTarget = null;
+            if (shapeOk && _bones[0] != null)
+            {
+                int hits = Physics.OverlapSphereNonAlloc(_bones[0].position, GRIP_RADIUS, _gripHits);
+                for (int k = 0; k < hits; k++)
+                {
+                    Rigidbody rb = _gripHits[k].attachedRigidbody;
+                    if (rb == null || rb.isKinematic)
+                    {
+                        continue;
+                    }
+                    if (containingAtom != null && rb.transform.IsChildOf(containingAtom.transform))
+                    {
+                        continue;
+                    }
+                    _gripTarget = rb;
+                    _gripCollision = true;
+                    break;
+                }
+            }
+            _gripActive = shapeOk && _gripCollision;
         }
 
         void Report()
