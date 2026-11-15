@@ -365,13 +365,14 @@ class PoseForm : Form
     {
         SN.Quaternion hand = handRot;
         StringBuilder sb = new StringBuilder();
-        sb.AppendLine("joint,px,py,pz,rx,ry,rz");
+        sb.AppendLine("joint,px,py,pz,rx,ry,rz,lx,ly,lz");
         for (int i = 0; i < 16; i++)
         {
             SN.Vector3 p = WorldPos(i, hand);
             SN.Vector3 e = QuatToEuler(WorldRot(i, hand));
-            sb.AppendLine(string.Format("{0},{1:F4},{2:F4},{3:F4},{4:F1},{5:F1},{6:F1}",
-                names[i], p.X, p.Y, p.Z, e.X, e.Y, e.Z));
+            SN.Vector3 l = QuatToEuler(bones[i].Rot);
+            sb.AppendLine(string.Format("{0},{1:F4},{2:F4},{3:F4},{4:F1},{5:F1},{6:F1},{7:F1},{8:F1},{9:F1}",
+                names[i], p.X, p.Y, p.Z, e.X, e.Y, e.Z, l.X, l.Y, l.Z));
         }
         string dir = System.IO.Path.GetDirectoryName(Application.ExecutablePath);
         string path = System.IO.Path.Combine(dir, "pose_state.csv");
