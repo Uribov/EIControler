@@ -663,7 +663,7 @@ class PoseForm : Form
                 // 指节用长方体：有清晰的面和棱，能看出绕指骨轴的扭转
                 SN.Vector3 segDir = end - start;
                 AddBox(faces, (start + end) * 0.5f,
-                       new SN.Vector3(b.Width * 0.5f, b.Width * 0.35f, segDir.Length() * 0.5f),
+                       new SN.Vector3(b.Width * 0.5f, b.Width * 0.25f, segDir.Length() * 0.5f),
                        LookRot(segDir, SN.Vector3.UnitZ), i, light, dragBone == i);
             }
             AddSphere(faces, start, b.Width * 0.46f, FingerColor(i), 0f);
